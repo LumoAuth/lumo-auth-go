@@ -125,7 +125,7 @@ func TestRouteConstantsMatchRegistryKeys(t *testing.T) {
 	constants := []string{
 		RoutePermissionsCheck, RoutePermissionsCheckBulk, RoutePermissionsCheckAny,
 		RoutePermissionsCheckAll, RoutePermissionsList,
-		RouteZanzibarCheck,
+		RouteZanzibarCheck, RouteZanzibarExpand,
 		RouteAbacCheck, RouteAbacCheckBulk, RouteAbacMyAttributes,
 		RouteAbacSetUserAttribute, RouteAbacResourceAttributes,
 		RouteAbacSetResourceAttribute, RouteAbacAttributeDefinitions,

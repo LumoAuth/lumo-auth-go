@@ -99,6 +99,21 @@ type ZanzibarCheck struct {
 	User     string `json:"user,omitempty"`
 }
 
+// ZanzibarUsersetNode is a node in an expansion tree. Leaves carry Subjects;
+// union/intersection nodes carry Children of the same shape.
+type ZanzibarUsersetNode struct {
+	Type     string                `json:"type"` // "union", "intersection" or "leaf"
+	Object   string                `json:"object,omitempty"`
+	Relation string                `json:"relation,omitempty"`
+	Children []ZanzibarUsersetNode `json:"children,omitempty"`
+	Subjects []string              `json:"subjects,omitempty"`
+}
+
+// zanzibarExpandResponse is the wire envelope; callers get the tree itself.
+type zanzibarExpandResponse struct {
+	Tree *ZanzibarUsersetNode `json:"tree"`
+}
+
 // ── ABAC ──────────────────────────────────────────────────────────────
 
 // AbacMatchedPolicy is a policy that contributed to an ABAC decision.

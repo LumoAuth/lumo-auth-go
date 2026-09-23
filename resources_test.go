@@ -217,10 +217,65 @@ func TestZanzibarResource(t *testing.T) {
 		}
 	})
 
+	t.Run("Expand", func(t *testing.T) {
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
+			"tree": map[string]any{
+				"type":     "union",
+				"object":   "document:readme",
+				"relation": "viewer",
+				"children": []any{
+					map[string]any{
+						"type":     "leaf",
+						"object":   "document:readme",
+						"relation": "viewer",
+						"subjects": []any{"user:alice", "team:eng#member"},
+					},
+				},
+			},
+		}))
+
+		tree, err := client.Zanzibar.Expand(ctx, "document:readme", "viewer")
+		if err != nil {
+			t.Fatalf("Expand: %v", err)
+		}
+		if calls[0].Path != "/api/v1/authz/zanzibar/expand" {
+			t.Errorf("path = %q", calls[0].Path)
+		}
+		// Expand takes no subject; sending one would be a different call.
+		if _, ok := calls[0].Body["subject"]; ok {
+			t.Errorf("Expand must not send a subject, body = %v", calls[0].Body)
+		}
+		if tree.Type != "union" || len(tree.Children) != 1 {
+			t.Fatalf("tree = %+v", tree)
+		}
+		if got := tree.Children[0].Subjects; len(got) != 2 || got[0] != "user:alice" {
+			t.Errorf("leaf subjects = %v", got)
+		}
+	})
+
+	t.Run("Expand rejects a response without a tree", func(t *testing.T) {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"allowed":true}`))
+		})
+
+		if _, err := client.Zanzibar.Expand(ctx, "document:readme", "viewer"); !errors.Is(err, ErrValidation) {
+			t.Errorf("a tree-less response should be a validation error, got %v", err)
+		}
+	})
+
 	t.Run("validates tuple format", func(t *testing.T) {
 		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 			t.Error("no request should have been sent")
 		})
+
+		// Expand validates the same object/relation halves, minus the subject.
+		for _, pair := range [][2]string{{"readme", "viewer"}, {"document:readme", ""}, {"", "viewer"}} {
+			if _, err := client.Zanzibar.Expand(ctx, pair[0], pair[1]); !errors.Is(err, ErrValidation) {
+				t.Errorf("pair %v should be rejected client-side, got %v", pair, err)
+			}
+		}
 
 		cases := [][3]string{
 			{"readme", "viewer", "user:bob"},     // object missing a namespace

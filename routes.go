@@ -35,7 +35,8 @@ const (
 	RoutePermissionsList      = "permissions.list"
 
 	// ── Zanzibar (ReBAC) ──────────────────────────────────────────────
-	RouteZanzibarCheck = "zanzibar.check"
+	RouteZanzibarCheck  = "zanzibar.check"
+	RouteZanzibarExpand = "zanzibar.expand"
 
 	// ── ABAC — org-scoped ─────────────────────────────────────────────
 	RouteAbacCheck                = "abac.check"
@@ -101,7 +102,8 @@ var Routes = map[string]Route{
 	RoutePermissionsList:      {"GET", "/api/v1/authz/permissions"},
 
 	// ── Zanzibar (ReBAC) ──────────────────────────────────────────────
-	RouteZanzibarCheck: {"POST", "/api/v1/authz/zanzibar/check"},
+	RouteZanzibarCheck:  {"POST", "/api/v1/authz/zanzibar/check"},
+	RouteZanzibarExpand: {"POST", "/api/v1/authz/zanzibar/expand"},
 
 	// ── ABAC — org-scoped ─────────────────────────────────────────────
 	RouteAbacCheck:              {"POST", orgBase + "/abac/check"},
