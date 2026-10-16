@@ -133,3 +133,33 @@ func TestContractErrorCodes(t *testing.T) {
 		t.Errorf("errors.go defines %d codes, the contract %d", len(codes), len(contract.Errors))
 	}
 }
+
+func TestContractTokenTypes(t *testing.T) {
+	dir := contractDir(t)
+	var contract struct {
+		Types map[string]struct {
+			URN   string            `json:"urn"`
+			Names map[string]string `json:"names"`
+		} `json:"types"`
+	}
+	loadContract(t, dir, "token-types.json", &contract)
+	constants := map[string]string{
+		"TokenTypeAccessToken":  TokenTypeAccessToken,
+		"TokenTypeJWT":          TokenTypeJWT,
+		"TokenTypeIDToken":      TokenTypeIDToken,
+		"TokenTypeRefreshToken": TokenTypeRefreshToken,
+	}
+	for key, spec := range contract.Types {
+		got, ok := constants[spec.Names["go"]]
+		if !ok {
+			t.Errorf("%s: constant %s is not defined in resource_auth.go", key, spec.Names["go"])
+			continue
+		}
+		if got != spec.URN {
+			t.Errorf("%s: %s = %q, contract %q", key, spec.Names["go"], got, spec.URN)
+		}
+	}
+	if len(constants) != len(contract.Types) {
+		t.Errorf("resource_auth.go defines %d token types, the contract %d", len(constants), len(contract.Types))
+	}
+}

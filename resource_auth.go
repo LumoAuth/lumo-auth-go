@@ -8,7 +8,18 @@ import (
 // RFC 8693 token-exchange constants.
 const (
 	GrantTypeTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange"
-	TokenTypeAccessToken   = "urn:ietf:params:oauth:token-type:access_token"
+	// TokenTypeAccessToken is an opaque or at+jwt access token issued by the
+	// organization — the default subject/actor type.
+	TokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
+	// TokenTypeJWT is an at+jwt access token, or an external workload identity
+	// token (Kubernetes, AWS, GCP, Azure, GitHub, SPIFFE) presented by a
+	// registered agent.
+	TokenTypeJWT = "urn:ietf:params:oauth:token-type:jwt"
+	// TokenTypeIDToken is an OpenID Connect ID token issued by the organization
+	// to the exchanging client.
+	TokenTypeIDToken = "urn:ietf:params:oauth:token-type:id_token"
+	// TokenTypeRefreshToken is a refresh token issued to the exchanging client.
+	TokenTypeRefreshToken = "urn:ietf:params:oauth:token-type:refresh_token"
 )
 
 // AuthResource covers the org-scoped OAuth 2.1 endpoints: authorize, token,
@@ -188,6 +199,14 @@ type TokenExchangeParams struct {
 	Audience string
 	// Scopes optionally narrows the issued token.
 	Scopes []string
+	// SubjectTokenType declares what SubjectToken is (TokenTypeAccessToken,
+	// TokenTypeJWT, TokenTypeIDToken or TokenTypeRefreshToken). Empty means
+	// TokenTypeAccessToken. The server refuses a token that does not match
+	// its declared type (sdk-contract/token-types.json).
+	SubjectTokenType string
+	// ActorTokenType declares what ActorToken is; empty means
+	// TokenTypeAccessToken.
+	ActorTokenType string
 }
 
 // TokenExchange performs an RFC 8693 exchange — the primitive behind
@@ -199,10 +218,10 @@ func (r *AuthResource) TokenExchange(ctx context.Context, params TokenExchangePa
 	form := url.Values{}
 	form.Set("grant_type", GrantTypeTokenExchange)
 	form.Set("subject_token", params.SubjectToken)
-	form.Set("subject_token_type", TokenTypeAccessToken)
+	form.Set("subject_token_type", tokenTypeOrDefault(params.SubjectTokenType))
 	if params.ActorToken != "" {
 		form.Set("actor_token", params.ActorToken)
-		form.Set("actor_token_type", TokenTypeAccessToken)
+		form.Set("actor_token_type", tokenTypeOrDefault(params.ActorTokenType))
 	}
 	if params.Audience != "" {
 		form.Set("audience", params.Audience)
@@ -271,4 +290,13 @@ func (r *AuthResource) tokenRequest(ctx context.Context, form url.Values) (*Toke
 		return nil, NewValidationError("the token endpoint returned no access_token")
 	}
 	return &token, nil
+}
+
+// tokenTypeOrDefault returns the declared RFC 8693 token type, or the
+// access-token type when none was chosen.
+func tokenTypeOrDefault(tokenType string) string {
+	if tokenType == "" {
+		return TokenTypeAccessToken
+	}
+	return tokenType
 }

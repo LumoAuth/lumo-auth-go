@@ -968,6 +968,22 @@ func TestAuthResource(t *testing.T) {
 			form.Get("actor_token_type") != TokenTypeAccessToken {
 			t.Errorf("both token types should be declared: %v", form)
 		}
+
+		// An ID token (or workload JWT) is declared as such; the default stays access_token.
+		if _, err := client.Auth.TokenExchange(ctx, TokenExchangeParams{
+			SubjectToken:     "id-token",
+			SubjectTokenType: TokenTypeIDToken,
+			ActorToken:       "agent-token",
+		}); err != nil {
+			t.Fatalf("TokenExchange(id_token): %v", err)
+		}
+		typed := calls[1].Form
+		if typed.Get("subject_token_type") != TokenTypeIDToken {
+			t.Errorf("subject_token_type = %q, want the declared id_token type", typed.Get("subject_token_type"))
+		}
+		if typed.Get("actor_token_type") != TokenTypeAccessToken {
+			t.Errorf("actor_token_type = %q, want the access_token default", typed.Get("actor_token_type"))
+		}
 		if form.Get("scope") != "read:documents" {
 			t.Errorf("scope = %q", form.Get("scope"))
 		}
