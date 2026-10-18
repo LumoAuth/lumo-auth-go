@@ -159,8 +159,16 @@ func (c *DelegationChain) SetUserToken(sessionID, accessToken string) error {
 
 // Exchange produces a delegated token for a session, combining the user's
 // token (subject) with the agent's (actor). The result is cached; scopes
-// may only narrow what the user consented to.
+// may only narrow what the user consented to. The token is bound to this
+// agent; use ExchangeForResource to bind it to the API it will be sent to.
 func (c *DelegationChain) Exchange(ctx context.Context, sessionID string, scopes ...string) (string, error) {
+	return c.ExchangeForResource(ctx, sessionID, "", scopes...)
+}
+
+// ExchangeForResource is Exchange with an RFC 8707 resource indicator: the
+// https URL in resource becomes the delegated token's `aud`. The result
+// replaces the session's cached delegated token.
+func (c *DelegationChain) ExchangeForResource(ctx context.Context, sessionID, resource string, scopes ...string) (string, error) {
 	user, err := c.ensureUserToken(ctx, sessionID)
 	if err != nil {
 		return "", err
@@ -170,7 +178,7 @@ func (c *DelegationChain) Exchange(ctx context.Context, sessionID string, scopes
 		return "", err
 	}
 
-	response, err := c.resource.Exchange(ctx, user.accessToken, agentToken, scopes...)
+	response, err := c.resource.ExchangeForResource(ctx, user.accessToken, agentToken, resource, scopes...)
 	if err != nil {
 		return "", annotateDelegationError(err, "token exchange failed")
 	}
@@ -229,6 +237,12 @@ func (c *DelegationChain) DoRaw(ctx context.Context, sessionID, method, path str
 //
 // subAgentToken is the sub-agent's own client-credentials token.
 func (c *DelegationChain) DelegateToSubAgent(ctx context.Context, sessionID, subAgentToken string, scopes ...string) (string, error) {
+	return c.DelegateToSubAgentForResource(ctx, sessionID, subAgentToken, "", scopes...)
+}
+
+// DelegateToSubAgentForResource is DelegateToSubAgent with an RFC 8707
+// resource indicator for the sub-agent's token (its `aud`).
+func (c *DelegationChain) DelegateToSubAgentForResource(ctx context.Context, sessionID, subAgentToken, resource string, scopes ...string) (string, error) {
 	if subAgentToken == "" {
 		return "", NewValidationError("the sub-agent's own access token is required")
 	}
@@ -237,7 +251,7 @@ func (c *DelegationChain) DelegateToSubAgent(ctx context.Context, sessionID, sub
 		return "", err
 	}
 
-	response, err := c.resource.Exchange(ctx, ourToken, subAgentToken, scopes...)
+	response, err := c.resource.ExchangeForResource(ctx, ourToken, subAgentToken, resource, scopes...)
 	if err != nil {
 		return "", annotateDelegationError(err, "nested delegation failed")
 	}

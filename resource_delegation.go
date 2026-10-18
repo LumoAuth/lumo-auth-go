@@ -60,7 +60,15 @@ func (r *DelegationResource) RefreshUserToken(ctx context.Context, params Refres
 // Exchange combines a subject token (the user) with an actor token (the
 // agent) into a delegated token. The resulting JWT carries an `act` claim
 // recording the chain, so every downstream action is attributable to both.
+// The token is bound to the acting agent; use ExchangeForResource to bind it
+// to the API it will be sent to.
 func (r *DelegationResource) Exchange(ctx context.Context, subjectToken, actorToken string, scopes ...string) (*TokenResponse, error) {
+	return r.ExchangeForResource(ctx, subjectToken, actorToken, "", scopes...)
+}
+
+// ExchangeForResource is Exchange with an RFC 8707 resource indicator: the
+// https URL in resource becomes the delegated token's `aud`.
+func (r *DelegationResource) ExchangeForResource(ctx context.Context, subjectToken, actorToken, resource string, scopes ...string) (*TokenResponse, error) {
 	if subjectToken == "" {
 		return nil, NewValidationError("a subject token is required")
 	}
@@ -71,6 +79,7 @@ func (r *DelegationResource) Exchange(ctx context.Context, subjectToken, actorTo
 		SubjectToken: subjectToken,
 		ActorToken:   actorToken,
 		Scopes:       scopes,
+		Resource:     resource,
 	})
 }
 

@@ -19,6 +19,8 @@ const (
 	// to the exchanging client.
 	TokenTypeIDToken = "urn:ietf:params:oauth:token-type:id_token"
 	// TokenTypeRefreshToken is a refresh token issued to the exchanging client.
+	// It is refused as the subject when an agent acts on a user's behalf
+	// (ActorToken is an agent access token): 400 invalid_request.
 	TokenTypeRefreshToken = "urn:ietf:params:oauth:token-type:refresh_token"
 )
 
@@ -194,9 +196,13 @@ type TokenExchangeParams struct {
 	// ActorToken is the token of the party doing the acting (the agent);
 	// set it to build a delegation chain with an `act` claim.
 	ActorToken string
-	// Audience scopes the issued token to one resource (an MCP server id,
-	// for instance).
+	// Audience is sent as the RFC 8693 `audience` parameter. LumoAuth binds
+	// the issued token's `aud` from Resource, not from Audience.
 	Audience string
+	// Resource is the RFC 8707 resource indicator — the absolute https URL
+	// of the API the issued token is for. It becomes its `aud`; without it
+	// an agent on-behalf-of token is bound to the acting agent's id.
+	Resource string
 	// Scopes optionally narrows the issued token.
 	Scopes []string
 	// SubjectTokenType declares what SubjectToken is (TokenTypeAccessToken,
@@ -225,6 +231,9 @@ func (r *AuthResource) TokenExchange(ctx context.Context, params TokenExchangePa
 	}
 	if params.Audience != "" {
 		form.Set("audience", params.Audience)
+	}
+	if params.Resource != "" {
+		form.Set("resource", params.Resource)
 	}
 	if len(params.Scopes) > 0 {
 		form.Set("scope", joinScopes(params.Scopes))

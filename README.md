@@ -97,7 +97,7 @@ ambiguous credentials, so a token provider that returns a token wins.
 
 | Namespace | Covers |
 | --- | --- |
-| `client.Auth` | OAuth 2.1: authorization URLs, code exchange, refresh, client credentials, token exchange (`TokenExchangeParams.SubjectTokenType` / `ActorTokenType` declare the RFC 8693 type: `TokenTypeAccessToken` (default), `TokenTypeJWT` for an at+jwt access token or external workload JWT, `TokenTypeIDToken` for an OpenID Connect ID token, `TokenTypeRefreshToken`; the server refuses a token that does not match its declared type), revocation, UserInfo |
+| `client.Auth` | OAuth 2.1: authorization URLs, code exchange, refresh, client credentials, token exchange (`TokenExchangeParams.SubjectTokenType` / `ActorTokenType` declare the RFC 8693 type: `TokenTypeAccessToken` (default), `TokenTypeJWT` for an at+jwt access token or external workload JWT, `TokenTypeIDToken` for an OpenID Connect ID token, `TokenTypeRefreshToken` (not accepted as the subject when an agent acts on a user's behalf); the server refuses a token that does not match its declared type; `TokenExchangeParams.Resource` (or `Delegation.ExchangeForResource` / `DelegationChain.ExchangeForResource`) is the RFC 8707 https URL that becomes the token's `aud` — LumoAuth does not bind `aud` from `Audience`), revocation, UserInfo |
 | `client.Permissions` | RBAC: `Check`, `CheckBulk`, `CheckAny`, `CheckAll`, `List` |
 | `client.Zanzibar` | ReBAC: `Check`, plus `IsViewer` / `IsEditor` / `IsOwner` / `IsMember` / `IsAdmin` |
 | `client.Abac` | Policy evaluation, bulk checks, user and resource attributes |

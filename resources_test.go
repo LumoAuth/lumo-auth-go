@@ -987,6 +987,19 @@ func TestAuthResource(t *testing.T) {
 		if form.Get("scope") != "read:documents" {
 			t.Errorf("scope = %q", form.Get("scope"))
 		}
+		if form.Has("resource") {
+			t.Errorf("resource sent without being asked: %v", form["resource"])
+		}
+
+		// The RFC 8707 resource indicator binds the delegated token's aud.
+		if _, err := client.Delegation.ExchangeForResource(ctx, "user-token", "agent-token",
+			"https://api.example.com", "read:documents"); err != nil {
+			t.Fatalf("ExchangeForResource: %v", err)
+		}
+		bound := calls[2].Form
+		if bound.Get("resource") != "https://api.example.com" || bound.Get("scope") != "read:documents" {
+			t.Errorf("form = %v, want the resource indicator and scope", bound)
+		}
 	})
 
 	t.Run("Revoke", func(t *testing.T) {
