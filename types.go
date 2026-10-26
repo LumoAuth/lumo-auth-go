@@ -127,9 +127,21 @@ type AbacMatchedPolicy struct {
 // AbacDecision is the outcome of evaluating ABAC policies for one
 // resource/action pair.
 type AbacDecision struct {
-	Allowed         bool                `json:"allowed"`
-	Reason          string              `json:"reason,omitempty"`
+	Allowed bool   `json:"allowed"`
+	Reason  string `json:"reason,omitempty"`
+	// MatchedPolicies lists the policies that applied. A caller without the
+	// policies.view permission receives only each policy's ID and Name.
 	MatchedPolicies []AbacMatchedPolicy `json:"matchedPolicies,omitempty"`
+	// ResourceType, Action and ResourceID echo the evaluated target.
+	ResourceType string `json:"resourceType,omitempty"`
+	Action       string `json:"action,omitempty"`
+	ResourceID   string `json:"resourceId,omitempty"`
+	// Index is the position of this result in a bulk request (0 for a
+	// single check).
+	Index int `json:"index,omitempty"`
+	// Error is set on a bulk result whose entry the server could not
+	// evaluate; Allowed is then false.
+	Error string `json:"error,omitempty"`
 
 	// Raw is the complete decoded decision, including the evaluation
 	// context the server echoed back.

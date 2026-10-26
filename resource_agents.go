@@ -12,6 +12,10 @@ type AgentsResource struct {
 // check to run before an LLM tool call, and it writes an audit record
 // whichever way the decision goes.
 //
+// The keys ip, userAgent, requestMethod and requestPath in actionContext
+// always describe the request LumoAuth received. A value you pass under one
+// of those names is kept under pep instead, as in ABAC.
+//
 //	decision, err := client.Agents.Ask(ctx, "document.read", map[string]any{"id": "doc_99"})
 //	if err != nil {
 //	    return err
@@ -45,6 +49,9 @@ func (r *AgentsResource) IsAllowed(ctx context.Context, action string, actionCon
 }
 
 // Me returns the calling agent's own identity, capabilities, and workspace.
+//
+// For an agent credential, Capabilities lists the agent's capability roles.
+// A user access token without the authz:read scope gets an empty list.
 func (r *AgentsResource) Me(ctx context.Context) (*AgentIdentity, error) {
 	var identity AgentIdentity
 	if err := r.http.call(ctx, RouteAgentsMe, nil, nil, &identity); err != nil {

@@ -396,6 +396,7 @@ func annotateDelegationError(err error, prefix string) error {
 	}
 	annotated := newAPIError(apiErr.StatusCode, apiErr.Code, prefix+": "+apiErr.Message, apiErr.Body)
 	annotated.RetryAfter = apiErr.RetryAfter
+	annotated.RequiredScopes = apiErr.RequiredScopes
 	annotated.cause = err
 	return annotated
 }

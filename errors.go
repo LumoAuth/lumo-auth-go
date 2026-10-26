@@ -116,6 +116,14 @@ type APIError struct {
 	Body any
 	// RetryAfter carries the Retry-After hint on 429 responses (0 if absent).
 	RetryAfter time.Duration
+	// RequiredScopes lists the scopes a 403 scope refusal names in
+	// details.required_scopes; nil when the body has none. The server sends
+	//
+	//	{"error":"forbidden","message":"Insufficient scope: …","status":403,
+	//	 "details":{"required_scopes":["authz:read"],"granted_scopes":[…]}}
+	//
+	// when the credential lacks a user-delegated scope the route needs.
+	RequiredScopes []string
 }
 
 // Is additionally matches ErrAPI for every status, so callers can catch all
@@ -140,10 +148,35 @@ func newAPIError(status int, code, message string, body any) *APIError {
 		code = defaultCodeForStatus(status)
 	}
 	return &APIError{
-		BaseError:  newError(kind, code, message),
-		StatusCode: status,
-		Body:       body,
+		BaseError:      newError(kind, code, message),
+		StatusCode:     status,
+		Body:           body,
+		RequiredScopes: requiredScopesFrom(body),
 	}
+}
+
+// requiredScopesFrom reads details.required_scopes from a decoded JSON
+// error body, keeping only non-empty strings.
+func requiredScopesFrom(body any) []string {
+	m, ok := body.(map[string]any)
+	if !ok {
+		return nil
+	}
+	details, ok := m["details"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	raw, ok := details["required_scopes"].([]any)
+	if !ok {
+		return nil
+	}
+	var scopes []string
+	for _, item := range raw {
+		if s, ok := item.(string); ok && s != "" {
+			scopes = append(scopes, s)
+		}
+	}
+	return scopes
 }
 
 func defaultCodeForStatus(status int) string {

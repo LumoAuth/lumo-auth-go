@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"reflect"
 )
 
 // AbacResource covers attribute-based access control: policy evaluation
@@ -11,6 +12,10 @@ import (
 // management.
 //
 // ABAC is org-scoped, so the client needs an org ID.
+//
+// A user access token needs the abac:read scope for checks and attribute
+// reads, and abac:write to set attributes. Organization API keys are not
+// accepted on the ABAC routes.
 //
 // Note the wire format uses camelCase keys (resourceType, resourceId);
 // this resource takes Go-shaped params and translates.
@@ -26,12 +31,20 @@ type AbacCheckParams struct {
 	Action string
 	// ResourceID identifies the specific instance, when there is one.
 	ResourceID string
-	// Context supplies resource and environment attributes for the
-	// evaluation, e.g. {"environment": {"ip": "10.0.0.1"}}.
+	// Context supplies environment attributes for the evaluation. The SDK
+	// sends it as the request's "environment" object, which the policy
+	// engine reads. The keys ip, userAgent, requestMethod and requestPath
+	// always describe the request that LumoAuth received; values that you
+	// pass under those names are kept under "pep" instead, so forward the
+	// end user's IP as {"pep": {"ip": "10.0.0.1"}}.
+	//
+	// In CheckBulk the server applies one environment to every check, so
+	// every entry must carry the same Context (or none).
 	Context map[string]any
 }
 
-func (p AbacCheckParams) body() (map[string]any, error) {
+// target returns the resourceType/action/resourceId part of a check body.
+func (p AbacCheckParams) target() (map[string]any, error) {
 	if p.ResourceType == "" {
 		return nil, NewValidationError("ResourceType is required for an ABAC check")
 	}
@@ -42,8 +55,18 @@ func (p AbacCheckParams) body() (map[string]any, error) {
 	if p.ResourceID != "" {
 		body["resourceId"] = p.ResourceID
 	}
-	if context := copyStringMap(p.Context); context != nil {
-		body["context"] = context
+	return body, nil
+}
+
+// body is the single-check request. The server reads the attributes from
+// "environment"; a "context" key would be ignored.
+func (p AbacCheckParams) body() (map[string]any, error) {
+	body, err := p.target()
+	if err != nil {
+		return nil, err
+	}
+	if environment := copyStringMap(p.Context); environment != nil {
+		body["environment"] = environment
 	}
 	return body, nil
 }
@@ -76,6 +99,10 @@ const AbacMaxBulkRequests = 100
 
 // CheckBulk evaluates up to AbacMaxBulkRequests pairs in one round trip.
 // Results come back in request order.
+//
+// The server applies one environment to every check in a bulk call. Give
+// every entry the same Context, or none; entries with different Context
+// values return a ValidationError before any request is sent.
 func (r *AbacResource) CheckBulk(ctx context.Context, checks []AbacCheckParams) ([]AbacDecision, error) {
 	if len(checks) == 0 {
 		return nil, NewValidationError("at least one check request is required")
@@ -85,21 +112,38 @@ func (r *AbacResource) CheckBulk(ctx context.Context, checks []AbacCheckParams) 
 			AbacMaxBulkRequests, len(checks))
 	}
 
-	requests := make([]map[string]any, 0, len(checks))
+	entries := make([]map[string]any, 0, len(checks))
 	for i, check := range checks {
-		body, err := check.body()
+		target, err := check.target()
 		if err != nil {
 			return nil, validationErrorf("check %d: %s", i, err.Error())
 		}
-		requests = append(requests, body)
+		if !sameEnvironment(check.Context, checks[0].Context) {
+			return nil, validationErrorf("check %d: every check in a bulk call must carry the same Context, "+
+				"because the server applies one environment to every check in a bulk call", i)
+		}
+		entries = append(entries, target)
+	}
+
+	body := map[string]any{"checks": entries}
+	if environment := copyStringMap(checks[0].Context); environment != nil {
+		body["environment"] = environment
 	}
 
 	var result AbacBulkDecision
-	if err := r.http.call(ctx, RouteAbacCheckBulk, nil,
-		&request{JSON: map[string]any{"requests": requests}}, &result); err != nil {
+	if err := r.http.call(ctx, RouteAbacCheckBulk, nil, &request{JSON: body}, &result); err != nil {
 		return nil, err
 	}
 	return result.Results, nil
+}
+
+// sameEnvironment reports whether two Context maps are equal, treating nil
+// and empty as the same.
+func sameEnvironment(a, b map[string]any) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 // MyAttributes returns every ABAC attribute for the authenticated user,

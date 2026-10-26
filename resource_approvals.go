@@ -62,6 +62,10 @@ func (o *WaitOptions) timeout() time.Duration {
 
 // Create opens an approval request and returns immediately with the
 // pending approval, whose Token identifies it.
+//
+// A portal test token is refused with 403 test_token_not_accepted. When the
+// user has no enrolled device, the server emails a plain notification with
+// no sign-in link and answers 202 email_fallback_sent.
 func (r *ApprovalsResource) Create(ctx context.Context, params ApprovalParams) (*ApprovalResult, error) {
 	if params.TaskID == "" {
 		return nil, NewValidationError("TaskID is required")

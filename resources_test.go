@@ -75,8 +75,12 @@ func TestPermissionsResource(t *testing.T) {
 		if calls[0].Body["permission"] != "document.edit" {
 			t.Errorf("body = %v", calls[0].Body)
 		}
-		if calls[0].Body["user_id"] != "user-7" {
-			t.Errorf("user_id should be forwarded: %v", calls[0].Body)
+		subject, _ := calls[0].Body["subject"].(map[string]any)
+		if subject["type"] != "user" || subject["id"] != "user-7" {
+			t.Errorf("UserID should go on the wire as subject {type: user, id}: %v", calls[0].Body)
+		}
+		if _, sent := calls[0].Body["user_id"]; sent {
+			t.Errorf("user_id must not be sent; the server ignores it: %v", calls[0].Body)
 		}
 		if ctx, _ := calls[0].Body["context"].(map[string]any); ctx["department"] != "eng" {
 			t.Errorf("context should be forwarded: %v", calls[0].Body)
@@ -131,6 +135,57 @@ func TestPermissionsResource(t *testing.T) {
 		}
 		if calls[1].Path != "/api/v1/authz/check-all" {
 			t.Errorf("CheckAll path = %q", calls[1].Path)
+		}
+	})
+
+	t.Run("bulk, any and all send the subject object", func(t *testing.T) {
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{"allowed": true, "results": map[string]bool{}}))
+		opts := &CheckOptions{UserID: "01a176cb-4095-7bb1-b3fe-7a9b8943e0cf"}
+
+		if _, err := client.Permissions.CheckBulk(ctx, []string{"a"}, opts); err != nil {
+			t.Fatalf("CheckBulk: %v", err)
+		}
+		if _, err := client.Permissions.CheckAny(ctx, []string{"a"}, opts); err != nil {
+			t.Fatalf("CheckAny: %v", err)
+		}
+		if _, err := client.Permissions.CheckAll(ctx, []string{"a"}, &CheckOptions{AgentID: "agt_1"}); err != nil {
+			t.Fatalf("CheckAll: %v", err)
+		}
+		want := []map[string]any{
+			{"type": "user", "id": "01a176cb-4095-7bb1-b3fe-7a9b8943e0cf"},
+			{"type": "user", "id": "01a176cb-4095-7bb1-b3fe-7a9b8943e0cf"},
+			{"type": "agent", "id": "agt_1"},
+		}
+		for i, call := range calls {
+			subject, _ := call.Body["subject"].(map[string]any)
+			if subject["type"] != want[i]["type"] || subject["id"] != want[i]["id"] {
+				t.Errorf("%s: subject = %v, want %v", call.Path, call.Body["subject"], want[i])
+			}
+			if _, sent := call.Body["user_id"]; sent {
+				t.Errorf("%s: user_id must not be sent: %v", call.Path, call.Body)
+			}
+		}
+	})
+
+	t.Run("no subject is sent when checking the caller", func(t *testing.T) {
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{"allowed": true}))
+		if _, err := client.Permissions.Check(ctx, "a", &CheckOptions{Context: map[string]any{"k": "v"}}); err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+		if _, sent := calls[0].Body["subject"]; sent {
+			t.Errorf("subject should be omitted for the caller: %v", calls[0].Body)
+		}
+	})
+
+	t.Run("UserID and AgentID together are rejected before calling out", func(t *testing.T) {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Error("no request should have been sent")
+		})
+		_, err := client.Permissions.Check(ctx, "a", &CheckOptions{UserID: "u", AgentID: "agt_1"})
+		if !errors.Is(err, ErrValidation) {
+			t.Errorf("expected a validation error, got %v", err)
 		}
 	})
 
@@ -311,7 +366,7 @@ func TestAbacResource(t *testing.T) {
 			ResourceType: "document",
 			Action:       "read",
 			ResourceID:   "doc-123",
-			Context:      map[string]any{"environment": map[string]any{"ip": "10.0.0.1"}},
+			Context:      map[string]any{"pep": map[string]any{"ip": "10.0.0.1"}},
 		})
 		if err != nil {
 			t.Fatalf("Check: %v", err)
@@ -334,17 +389,29 @@ func TestAbacResource(t *testing.T) {
 		if calls[0].Body["resourceType"] != "document" || calls[0].Body["resourceId"] != "doc-123" {
 			t.Errorf("the wire format is camelCase: %v", calls[0].Body)
 		}
+		environment, _ := calls[0].Body["environment"].(map[string]any)
+		if pep, _ := environment["pep"].(map[string]any); pep["ip"] != "10.0.0.1" {
+			t.Errorf("Context should go on the wire as environment: %v", calls[0].Body)
+		}
+		if _, sent := calls[0].Body["context"]; sent {
+			t.Errorf("context must not be sent; the server ignores it: %v", calls[0].Body)
+		}
 	})
 
 	t.Run("CheckBulk", func(t *testing.T) {
 		var calls []capture
 		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
-			"results": []map[string]any{{"allowed": true}, {"allowed": false}},
+			"results": []map[string]any{
+				{"index": 0, "resourceType": "document", "action": "read", "resourceId": "1", "allowed": true, "reason": "ok"},
+				{"index": 1, "allowed": false, "error": "Missing required fields"},
+			},
+			"user_id": "u1",
 		}))
 
+		env := map[string]any{"pep": map[string]any{"ip": "10.0.0.1"}}
 		decisions, err := client.Abac.CheckBulk(ctx, []AbacCheckParams{
-			{ResourceType: "document", Action: "read", ResourceID: "1"},
-			{ResourceType: "document", Action: "delete", ResourceID: "2"},
+			{ResourceType: "document", Action: "read", ResourceID: "1", Context: env},
+			{ResourceType: "document", Action: "delete", ResourceID: "2", Context: map[string]any{"pep": map[string]any{"ip": "10.0.0.1"}}},
 		})
 		if err != nil {
 			t.Fatalf("CheckBulk: %v", err)
@@ -352,10 +419,50 @@ func TestAbacResource(t *testing.T) {
 		if len(decisions) != 2 || !decisions[0].Allowed || decisions[1].Allowed {
 			t.Errorf("decisions = %+v", decisions)
 		}
+		if decisions[0].ResourceID != "1" || decisions[1].Index != 1 || decisions[1].Error == "" {
+			t.Errorf("result fields not decoded: %+v", decisions)
+		}
 
-		requests, _ := calls[0].Body["requests"].([]any)
-		if len(requests) != 2 {
-			t.Fatalf("sent %d requests, want 2", len(requests))
+		checks, _ := calls[0].Body["checks"].([]any)
+		if len(checks) != 2 {
+			t.Fatalf("sent %d checks, want 2 (body %v)", len(checks), calls[0].Body)
+		}
+		if _, sent := calls[0].Body["requests"]; sent {
+			t.Errorf("requests must not be sent; the server reads checks: %v", calls[0].Body)
+		}
+		for i, c := range checks {
+			entry, _ := c.(map[string]any)
+			if _, has := entry["environment"]; has {
+				t.Errorf("check %d carries its own environment; the server ignores it", i)
+			}
+		}
+		environment, _ := calls[0].Body["environment"].(map[string]any)
+		if pep, _ := environment["pep"].(map[string]any); pep["ip"] != "10.0.0.1" {
+			t.Errorf("the shared Context should be the top-level environment: %v", calls[0].Body)
+		}
+	})
+
+	t.Run("CheckBulk without Context sends no environment", func(t *testing.T) {
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{"results": []map[string]any{{"allowed": true}}}))
+		if _, err := client.Abac.CheckBulk(ctx, []AbacCheckParams{{ResourceType: "document", Action: "read"}}); err != nil {
+			t.Fatalf("CheckBulk: %v", err)
+		}
+		if _, sent := calls[0].Body["environment"]; sent {
+			t.Errorf("environment should be omitted: %v", calls[0].Body)
+		}
+	})
+
+	t.Run("CheckBulk rejects different contexts before calling out", func(t *testing.T) {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Error("no request should have been sent")
+		})
+		_, err := client.Abac.CheckBulk(ctx, []AbacCheckParams{
+			{ResourceType: "document", Action: "read", Context: map[string]any{"a": 1}},
+			{ResourceType: "document", Action: "read"},
+		})
+		if !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), "one environment") {
+			t.Errorf("expected a validation error about one environment, got %v", err)
 		}
 	})
 

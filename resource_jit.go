@@ -174,7 +174,9 @@ func (r *JitResource) Token(ctx context.Context, requestID string) (*TokenRespon
 	return &token, nil
 }
 
-// Pending lists the permission requests awaiting human approval.
+// Pending lists the permission requests awaiting human approval. It is a
+// reviewer call: it needs a browser session or a user access token with the
+// jit:approve scope.
 func (r *JitResource) Pending(ctx context.Context) ([]JitRequest, error) {
 	var raw json.RawMessage
 	if err := r.http.call(ctx, RouteJitPending, nil, nil, &raw); err != nil {

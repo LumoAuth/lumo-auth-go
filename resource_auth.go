@@ -191,7 +191,9 @@ func (r *AuthResource) ClientCredentials(ctx context.Context, clientID, clientSe
 // TokenExchangeParams describes an RFC 8693 token exchange.
 type TokenExchangeParams struct {
 	// SubjectToken is the token representing the principal being acted
-	// for. Required.
+	// for. Required. The subject must still be active: a deactivated or
+	// blocked user, or a suspended agent, gets invalid_grant. A JIT task
+	// token is never accepted as the subject.
 	SubjectToken string
 	// ActorToken is the token of the party doing the acting (the agent);
 	// set it to build a delegation chain with an `act` claim.

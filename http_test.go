@@ -196,6 +196,44 @@ func TestErrorBodyIsPreserved(t *testing.T) {
 	}
 }
 
+func TestScopeRefusalExposesRequiredScopes(t *testing.T) {
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 403, map[string]any{
+			"error":   "forbidden",
+			"message": "Insufficient scope: this API key is missing a required scope",
+			"status":  403,
+			"details": map[string]any{
+				"required_scopes": []any{"authz:read"},
+				"granted_scopes":  []any{"admin:users:read"},
+			},
+		})
+	})
+
+	_, err := client.Permissions.List(context.Background())
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied, got %v", err)
+	}
+	apiErr, _ := AsAPIError(err)
+	if len(apiErr.RequiredScopes) != 1 || apiErr.RequiredScopes[0] != "authz:read" {
+		t.Errorf("RequiredScopes = %v, want [authz:read]", apiErr.RequiredScopes)
+	}
+}
+
+func TestPlainForbiddenHasNoRequiredScopes(t *testing.T) {
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 403, map[string]any{"error": "nope"})
+	})
+
+	_, err := client.Permissions.Check(context.Background(), "doc.edit", nil)
+	apiErr, ok := AsAPIError(err)
+	if !ok {
+		t.Fatalf("expected an *APIError, got %v", err)
+	}
+	if len(apiErr.RequiredScopes) != 0 {
+		t.Errorf("RequiredScopes = %v, want empty", apiErr.RequiredScopes)
+	}
+}
+
 func TestRetryAfterParsing(t *testing.T) {
 	t.Run("delay seconds", func(t *testing.T) {
 		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {

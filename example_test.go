@@ -56,7 +56,7 @@ func ExampleAbacResource_Check() {
 		Action:       "read",
 		ResourceID:   "doc-123",
 		Context: map[string]any{
-			"environment": map[string]any{"ip": "10.0.0.1"},
+			"pep": map[string]any{"ip": "10.0.0.1"}, // sent as the request's environment
 		},
 	})
 	if err != nil {
