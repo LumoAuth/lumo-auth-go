@@ -475,3 +475,32 @@ type McpToken struct {
 	ExpiresIn   int    `json:"expires_in,omitempty"`
 	Scope       string `json:"scope,omitempty"`
 }
+
+// McpToolSubject names the caller of an MCP tool: a user or an agent.
+type McpToolSubject struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+}
+
+// McpToolResource names the tool that a decision covers. Type is
+// "mcp_tool" and ID is "<serverId>/<tool>".
+type McpToolResource struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+}
+
+// McpToolDecision is the answer to McpResource.AuthorizeTool. A deny comes
+// back with Allowed set to false and a nil error.
+type McpToolDecision struct {
+	Allowed  bool            `json:"allowed"`
+	Subject  McpToolSubject  `json:"subject"`
+	Resource McpToolResource `json:"resource"`
+}
+
+// AgentMcpToolDecision is the answer to AgentsResource.AuthorizeMcpTool. A
+// deny comes back with Allowed set to false and a nil error.
+type AgentMcpToolDecision struct {
+	Allowed  bool            `json:"allowed"`
+	AgentID  string          `json:"agent_id,omitempty"`
+	Resource McpToolResource `json:"resource"`
+}

@@ -60,9 +60,13 @@ const (
 	RouteWebMagicLink  = "web.magicLink"
 
 	// ── Agents (identity) ─────────────────────────────────────────────
-	RouteAgentsAsk      = "agents.ask"
-	RouteAgentsMe       = "agents.me"
-	RouteAgentsRegister = "agents.register"
+	RouteAgentsAsk              = "agents.ask"
+	RouteAgentsAuthorizeMcpTool = "agents.authorizeMcpTool"
+	RouteAgentsMe               = "agents.me"
+	RouteAgentsRegister         = "agents.register"
+
+	// ── MCP (per-tool checks asked by an MCP server) ──────────────────
+	RouteMcpAuthorizeTool = "mcp.authorizeTool"
 
 	// ── Approvals (push-approval-for-actions) ─────────────────────────
 	RouteApprovalsCreate = "approvals.create"
@@ -131,9 +135,13 @@ var Routes = map[string]Route{
 	RouteWebMagicLink:  {"POST", "/orgs/{orgId}/magic-link"},
 
 	// ── Agents (identity) ─────────────────────────────────────────────
-	RouteAgentsAsk:      {"POST", orgBase + "/agents/ask"},
-	RouteAgentsMe:       {"GET", orgBase + "/agents/me"},
-	RouteAgentsRegister: {"POST", orgBase + "/agents/register"},
+	RouteAgentsAsk:              {"POST", orgBase + "/agents/ask"},
+	RouteAgentsAuthorizeMcpTool: {"POST", orgBase + "/agents/me/mcp/authorize"},
+	RouteAgentsMe:               {"GET", orgBase + "/agents/me"},
+	RouteAgentsRegister:         {"POST", orgBase + "/agents/register"},
+
+	// ── MCP ───────────────────────────────────────────────────────────
+	RouteMcpAuthorizeTool: {"POST", orgBase + "/mcp/servers/{serverId}/tools/authorize"},
 
 	// ── Approvals ─────────────────────────────────────────────────────
 	RouteApprovalsCreate: {"POST", orgBase + "/agents/me/approvals"},

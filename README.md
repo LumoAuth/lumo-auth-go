@@ -34,6 +34,7 @@ The SDK has the same namespaces and the same error codes as the [JS](../sdk-js) 
   - [Just-in-Time permissions](#just-in-time-permissions)
   - [Act on behalf of a user (delegation)](#act-on-behalf-of-a-user-delegation)
   - [Get a token for an MCP server](#get-a-token-for-an-mcp-server)
+  - [Check access to an MCP tool](#check-access-to-an-mcp-tool)
   - [AAuth: cryptographic agent identity](#aauth-cryptographic-agent-identity)
   - [Verify AAuth tokens on a resource server](#verify-aauth-tokens-on-a-resource-server)
   - [Call any other endpoint](#call-any-other-endpoint)
@@ -754,14 +755,77 @@ agent's token for one:
 token, err := agent.MCPToken(ctx, "https://mcp.example.com/mcp")
 ```
 
-The server ID is the MCP server's https URL. The SDK sends it as the RFC 8707 `resource`
-parameter, and LumoAuth sets the token's `aud` to it. A plain `http` URL works only for
-localhost and private hosts. An ID such as `urn:mcp:financial-data` cannot be bound to a
-server, so the SDK returns a `ValidationError` before it sends the request.
+Pass the Resource URI that the MCP server is registered with. It is the server's https
+URL. The SDK sends it as the RFC 8707 `resource` parameter, and LumoAuth sets the token's
+`aud` to it. A plain `http` URL works only for localhost and private hosts. An ID such as
+`urn:mcp:financial-data` cannot be bound to a server, so the SDK returns a
+`ValidationError` before it sends the request.
+
+The token names exactly one MCP server, and it works only at that server. LumoAuth's own
+API refuses it. This method sends no DPoP proof. If the MCP server requires DPoP, you need
+an exchange that is bound to a DPoP key.
 
 With a plain `Client`, call `client.Mcp.Token(ctx, serverID, subjectToken)`. Pass an empty
 `subjectToken` to exchange the client's own bearer token. `TokenDetailed` returns the full
 response.
+
+### Check access to an MCP tool
+
+LumoAuth can decide whether a caller may run one tool on a registered MCP server. Two
+methods ask this question. Both take the registered server ID, such as
+`mcp_0123456789abcdef01234567`. Do not pass the Resource URI here.
+
+**From the MCP server.** The MCP server first verifies the caller's token. Then it asks
+LumoAuth about that caller with its own token. It must never forward the caller's token,
+because the MCP specification forbids token passthrough. The server's OAuth client needs
+the `mcp:authorize` scope, and it must be one of the server's tool authorizers.
+
+`NewAgent` runs the client credentials grant and refreshes the token, so the MCP server
+can use it for its own client:
+
+```go
+mcpAuth, err := lumoauth.NewAgent(lumoauth.AgentConfig{
+    OrgID:        "acme-corp",
+    ClientID:     os.Getenv("MCP_CLIENT_ID"),
+    ClientSecret: os.Getenv("MCP_CLIENT_SECRET"),
+    Scopes:       []string{"mcp:authorize"},
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+// claims holds the verified MCP token of the caller.
+decision, err := mcpAuth.Mcp.AuthorizeTool(ctx, lumoauth.McpToolAuthorizeParams{
+    ServerID:    "mcp_0123456789abcdef01234567",
+    SubjectType: "user", // "agent" when the caller is an agent
+    SubjectID:   claims.Subject,
+    Tool:        "send_invoice",
+})
+if err != nil {
+    return err
+}
+if !decision.Allowed {
+    return errors.New("tool not allowed")
+}
+```
+
+Pass the `sub` claim of the verified token as `SubjectID`. For an agent, you can pass the
+claim as it is (`agent_agt_…`) or the bare agent ID (`agt_…`).
+
+**From the agent.** An agent can ask about itself before it calls a tool. The request
+uses the agent's own credential:
+
+```go
+decision, err := agent.AuthorizeMcpTool(ctx, "mcp_0123456789abcdef01234567", "send_invoice")
+```
+
+With a plain `Client`, call `client.Agents.AuthorizeMcpTool(ctx, serverID, tool)`.
+
+A deny is not an error. Both methods return a decision with `Allowed` set to false and a
+nil error. Other failures are errors as usual. A missing scope, or a client that is not a
+tool authorizer, gives `ErrPermissionDenied`. An unknown server gives `ErrNotFound`. The
+SDK checks the arguments before it sends the request. A tool name or server ID must not
+contain `/`, `:`, `#` or `*`, and a tool name has at most 80 characters.
 
 ### AAuth: cryptographic agent identity
 
@@ -1053,6 +1117,7 @@ API keys are not accepted on ABAC routes.
 | `Register(ctx, params)` | Create or update an agent record | `admin:agents:write` on a user token; not an API key |
 | `Agent.RequireCapability`, `HasCapability`, `CheckBudget` | Guards that return errors | agent credential |
 | `Agent.MCPToken(ctx, serverID)` | A token for an MCP server | agent credential |
+| `AuthorizeMcpTool(ctx, serverID, tool)`, `Agent.AuthorizeMcpTool` | May the agent run this MCP tool? A deny returns `Allowed` false | agent credential |
 
 ### `client.Approvals`
 
@@ -1090,8 +1155,9 @@ All of them need an agent credential. Portal test tokens are refused.
 
 | Method | What it does |
 | --- | --- |
-| `Token(ctx, serverID, subjectToken)` | A token for one MCP server; `serverID` is the server's https URL |
+| `Token(ctx, serverID, subjectToken)` | A token for one MCP server; `serverID` is the server's registered Resource URI |
 | `TokenDetailed(...)` | The same, with the full response |
+| `AuthorizeTool(ctx, McpToolAuthorizeParams)` | May a user or agent run this tool? Called by the MCP server with its own token (`mcp:authorize`); a deny returns `Allowed` false |
 
 ### Package functions
 
@@ -1122,6 +1188,8 @@ All of them need an agent credential. Portal test tokens are refused.
 | 403 `test_token_not_accepted` from `Approvals.Create` | The agent uses a test token from the portal | Use the agent's real credential |
 | `ErrApprovalNotDelivered` from `Approvals.Require` | The user has no enrolled push device | Ask the user to enrol a device in the LumoAuth app, then try again |
 | `ValidationError` from `Mcp.Token` about the server ID | The ID is not an http(s) URL, for example `urn:mcp:…` | Pass the MCP server's https URL, for example `https://mcp.example.com/mcp` |
+| `ValidationError` from `AuthorizeTool` or `AuthorizeMcpTool` about the server ID | The ID is a URL | Pass the registered server ID, for example `mcp_0123456789abcdef01234567` |
+| 403 `insufficient_scope` or `forbidden` from `Mcp.AuthorizeTool` | The token lacks `mcp:authorize`, or its client is not a tool authorizer of the server | Request `mcp:authorize` with the MCP server's own client, and list that client as a tool authorizer |
 | 400 `invalid_target` from `Mcp.Token` | The server URL uses plain `http` on a public host, or has a fragment | Use an `https` URL with no `#` part |
 | `ErrRateLimited` | Too many requests | Wait for `APIError.RetryAfter`, then retry |
 | `ErrConfig` mentioning the organization | The call needs an org ID | Set `WithOrgID` or `LUMOAUTH_ORG_ID` |

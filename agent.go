@@ -379,10 +379,18 @@ func (a *Agent) Register(ctx context.Context, params RegisterParams) (*AgentRegi
 }
 
 // MCPToken exchanges the agent's token for one bound to a secured MCP
-// server. serverID is the server's https URL, e.g.
-// "https://mcp.example.com/mcp"; see McpResource.Token.
+// server. serverID is the Resource URI that the server is registered with,
+// e.g. "https://mcp.example.com/mcp". The token works only at that server;
+// see McpResource.Token.
 func (a *Agent) MCPToken(ctx context.Context, serverID string) (string, error) {
 	return a.Mcp.Token(ctx, serverID, "")
+}
+
+// AuthorizeMcpTool asks whether this agent may run one tool on an MCP
+// server. serverID is the registered MCP server ID, not its URL. A deny
+// returns Allowed false and a nil error; see AgentsResource.AuthorizeMcpTool.
+func (a *Agent) AuthorizeMcpTool(ctx context.Context, serverID, tool string) (*AgentMcpToolDecision, error) {
+	return a.Agents.AuthorizeMcpTool(ctx, serverID, tool)
 }
 
 // ── Generic requests ──────────────────────────────────────────────────

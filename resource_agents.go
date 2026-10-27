@@ -60,6 +60,37 @@ func (r *AgentsResource) Me(ctx context.Context) (*AgentIdentity, error) {
 	return &identity, nil
 }
 
+// AuthorizeMcpTool asks whether the calling agent may run one tool on an
+// MCP server. It uses the agent's own credential, so it suits an agent that
+// checks a tool before it calls it. An MCP server must not use it, because
+// it would have to forward the agent's token; the server calls
+// Mcp.AuthorizeTool with its own token instead.
+//
+// serverID is the registered MCP server ID, for example
+// "mcp_0123456789abcdef01234567". It is not the Resource URI.
+//
+//	decision, err := agent.Agents.AuthorizeMcpTool(ctx, "mcp_0123456789abcdef01234567", "send_invoice")
+//	if err != nil {
+//	    return err
+//	}
+//	if !decision.Allowed {
+//	    return errors.New("tool refused")
+//	}
+//
+// A deny is not an error. It comes back with Allowed set to false and a nil
+// error. An unknown server is an error that matches ErrNotFound.
+func (r *AgentsResource) AuthorizeMcpTool(ctx context.Context, serverID, tool string) (*AgentMcpToolDecision, error) {
+	if err := validateMcpToolTarget(serverID, tool); err != nil {
+		return nil, err
+	}
+	body := map[string]any{"server_id": serverID, "tool": tool}
+	var decision AgentMcpToolDecision
+	if err := callMcpDecision(ctx, r.http, RouteAgentsAuthorizeMcpTool, nil, body, &decision); err != nil {
+		return nil, err
+	}
+	return &decision, nil
+}
+
 // RegisterParams describes an agent registration.
 type RegisterParams struct {
 	// Name is the human-readable agent name ("Document Analyser"). Required.

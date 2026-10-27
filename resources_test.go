@@ -1128,6 +1128,295 @@ func TestMcpResource(t *testing.T) {
 	})
 }
 
+// mcpDecisionServer answers every request with one status and body, and
+// records the request it got.
+func mcpDecisionServer(t *testing.T, got *capture, header *http.Header, status int, body any) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		*got = capture{Method: r.Method, Path: r.URL.EscapedPath()}
+		*header = r.Header.Clone()
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got.Body)
+		if status == http.StatusTooManyRequests {
+			w.Header().Set("Retry-After", "7")
+		}
+		writeJSON(w, status, body)
+	}
+}
+
+func TestMcpAuthorizeTool(t *testing.T) {
+	ctx := context.Background()
+	params := McpToolAuthorizeParams{
+		ServerID: "mcp_0123456789abcdef01234567", SubjectType: "agent",
+		SubjectID: "agent_agt_42", Tool: "send_invoice",
+	}
+	decisionBody := func(allowed bool) map[string]any {
+		return map[string]any{
+			"allowed":  allowed,
+			"subject":  map[string]any{"type": "agent", "id": "agt_42"},
+			"resource": map[string]any{"type": "mcp_tool", "id": "mcp_0123456789abcdef01234567/send_invoice"},
+		}
+	}
+
+	t.Run("allow sends the server's own bearer token, path and body", func(t *testing.T) {
+		var got capture
+		var header http.Header
+		client, _ := newTestClient(t, mcpDecisionServer(t, &got, &header, 200, decisionBody(true)),
+			WithAccessToken("mcp-server-cc-token"))
+
+		decision, err := client.Mcp.AuthorizeTool(ctx, params)
+		if err != nil {
+			t.Fatalf("AuthorizeTool: %v", err)
+		}
+		if !decision.Allowed || decision.Subject.ID != "agt_42" || decision.Subject.Type != "agent" ||
+			decision.Resource.Type != "mcp_tool" ||
+			decision.Resource.ID != "mcp_0123456789abcdef01234567/send_invoice" {
+			t.Errorf("decision = %+v", decision)
+		}
+		if got.Method != http.MethodPost ||
+			got.Path != "/orgs/acme-corp/api/v1/mcp/servers/mcp_0123456789abcdef01234567/tools/authorize" {
+			t.Errorf("request = %s %s", got.Method, got.Path)
+		}
+		if header.Get("Authorization") != "Bearer mcp-server-cc-token" || header.Get("X-API-Key") != "" {
+			t.Errorf("credential headers: Authorization=%q X-API-Key=%q",
+				header.Get("Authorization"), header.Get("X-API-Key"))
+		}
+		want := map[string]any{
+			"subject": map[string]any{"type": "agent", "id": "agent_agt_42"},
+			"tool":    "send_invoice",
+		}
+		if !equalJSON(got.Body, want) {
+			t.Errorf("body = %v, want %v", got.Body, want)
+		}
+	})
+
+	t.Run("the server ID is URL-encoded in the path", func(t *testing.T) {
+		var got capture
+		var header http.Header
+		client, _ := newTestClient(t, mcpDecisionServer(t, &got, &header, 200, decisionBody(true)),
+			WithAccessToken("tok"))
+		p := params
+		p.ServerID = "mcp a?b"
+		if _, err := client.Mcp.AuthorizeTool(ctx, p); err != nil {
+			t.Fatalf("AuthorizeTool: %v", err)
+		}
+		if got.Path != "/orgs/acme-corp/api/v1/mcp/servers/mcp%20a%3Fb/tools/authorize" {
+			t.Errorf("path = %q", got.Path)
+		}
+	})
+
+	t.Run("a 403 with allowed=false is a deny decision, not an error", func(t *testing.T) {
+		var got capture
+		var header http.Header
+		client, _ := newTestClient(t, mcpDecisionServer(t, &got, &header, 403, decisionBody(false)),
+			WithAccessToken("tok"))
+		decision, err := client.Mcp.AuthorizeTool(ctx, params)
+		if err != nil {
+			t.Fatalf("a deny must not be an error: %v", err)
+		}
+		if decision.Allowed || decision.Resource.ID != "mcp_0123456789abcdef01234567/send_invoice" {
+			t.Errorf("decision = %+v", decision)
+		}
+	})
+
+	errorCases := []struct {
+		name   string
+		status int
+		body   any
+		kind   error
+		code   string
+	}{
+		{"403 insufficient_scope", 403, map[string]any{"error": "insufficient_scope", "message": "needs mcp:authorize"}, ErrPermissionDenied, "insufficient_scope"},
+		{"403 forbidden", 403, map[string]any{"error": "forbidden"}, ErrPermissionDenied, "forbidden"},
+		{"403 allowed=true is still an error", 403, map[string]any{"allowed": true, "error": "forbidden"}, ErrPermissionDenied, "forbidden"},
+		{"401 invalid_token", 401, map[string]any{"error": "invalid_token"}, ErrAuthentication, "invalid_token"},
+		{"404 not_found", 404, map[string]any{"error": "not_found"}, ErrNotFound, "not_found"},
+		{"400 invalid_request", 400, map[string]any{"error": "invalid_request"}, ErrAPI, "invalid_request"},
+		{"429 too_many_requests", 429, map[string]any{"error": "too_many_requests"}, ErrRateLimited, "too_many_requests"},
+	}
+	for _, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got capture
+			var header http.Header
+			client, _ := newTestClient(t, mcpDecisionServer(t, &got, &header, tc.status, tc.body),
+				WithAccessToken("tok"))
+			decision, err := client.Mcp.AuthorizeTool(ctx, params)
+			if decision != nil || !errors.Is(err, tc.kind) {
+				t.Fatalf("got decision %+v, err %v; want %v", decision, err, tc.kind)
+			}
+			if ErrorCode(err) != tc.code {
+				t.Errorf("code = %q, want %q", ErrorCode(err), tc.code)
+			}
+			if tc.status == 429 {
+				apiErr, _ := AsAPIError(err)
+				if apiErr.RetryAfter != 7*time.Second {
+					t.Errorf("RetryAfter = %v", apiErr.RetryAfter)
+				}
+			}
+		})
+	}
+
+	t.Run("client-side validation", func(t *testing.T) {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Error("no request should have been sent")
+		}, WithAccessToken("tok"))
+		bad := []func(p *McpToolAuthorizeParams){
+			func(p *McpToolAuthorizeParams) { p.SubjectType = "service" },
+			func(p *McpToolAuthorizeParams) { p.SubjectType = "" },
+			func(p *McpToolAuthorizeParams) { p.SubjectID = "" },
+			func(p *McpToolAuthorizeParams) { p.ServerID = "" },
+			func(p *McpToolAuthorizeParams) { p.Tool = "" },
+			func(p *McpToolAuthorizeParams) { p.ServerID = "https://mcp.example.com/mcp" },
+			func(p *McpToolAuthorizeParams) { p.ServerID = "mcp#1" },
+			func(p *McpToolAuthorizeParams) { p.Tool = "a/b" },
+			func(p *McpToolAuthorizeParams) { p.Tool = "ns:tool" },
+			func(p *McpToolAuthorizeParams) { p.Tool = "tool#1" },
+			func(p *McpToolAuthorizeParams) { p.Tool = "*" },
+			func(p *McpToolAuthorizeParams) { p.Tool = strings.Repeat("t", 81) },
+		}
+		for i, mutate := range bad {
+			p := params
+			mutate(&p)
+			if _, err := client.Mcp.AuthorizeTool(ctx, p); !errors.Is(err, ErrValidation) {
+				t.Errorf("case %d (%+v): expected a validation error, got %v", i, p, err)
+			}
+		}
+		p := params
+		p.Tool = strings.Repeat("t", 80)
+		p.SubjectType = "user"
+		ok, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, 200, decisionBody(true))
+		}, WithAccessToken("tok"))
+		if _, err := ok.Mcp.AuthorizeTool(ctx, p); err != nil {
+			t.Errorf("an 80-character tool name should be accepted: %v", err)
+		}
+	})
+}
+
+func TestAgentsAuthorizeMcpTool(t *testing.T) {
+	ctx := context.Background()
+	body := func(allowed bool) map[string]any {
+		return map[string]any{
+			"allowed":  allowed,
+			"agent_id": "agt_42",
+			"resource": map[string]any{"type": "mcp_tool", "id": "mcp_0123456789abcdef01234567/send_invoice"},
+		}
+	}
+
+	t.Run("allow", func(t *testing.T) {
+		var got capture
+		var header http.Header
+		client, _ := newTestClient(t, mcpDecisionServer(t, &got, &header, 200, body(true)),
+			WithAccessToken("agk_agent_key"))
+		decision, err := client.Agents.AuthorizeMcpTool(ctx, "mcp_0123456789abcdef01234567", "send_invoice")
+		if err != nil {
+			t.Fatalf("AuthorizeMcpTool: %v", err)
+		}
+		if !decision.Allowed || decision.AgentID != "agt_42" || decision.Resource.Type != "mcp_tool" ||
+			decision.Resource.ID != "mcp_0123456789abcdef01234567/send_invoice" {
+			t.Errorf("decision = %+v", decision)
+		}
+		if got.Method != http.MethodPost || got.Path != "/orgs/acme-corp/api/v1/agents/me/mcp/authorize" {
+			t.Errorf("request = %s %s", got.Method, got.Path)
+		}
+		if header.Get("Authorization") != "Bearer agk_agent_key" {
+			t.Errorf("Authorization = %q", header.Get("Authorization"))
+		}
+		want := map[string]any{"server_id": "mcp_0123456789abcdef01234567", "tool": "send_invoice"}
+		if !equalJSON(got.Body, want) {
+			t.Errorf("body = %v, want %v", got.Body, want)
+		}
+	})
+
+	t.Run("a 403 with allowed=false is a deny decision", func(t *testing.T) {
+		var got capture
+		var header http.Header
+		client, _ := newTestClient(t, mcpDecisionServer(t, &got, &header, 403, body(false)),
+			WithAccessToken("tok"))
+		decision, err := client.Agents.AuthorizeMcpTool(ctx, "mcp_0123456789abcdef01234567", "send_invoice")
+		if err != nil {
+			t.Fatalf("a deny must not be an error: %v", err)
+		}
+		if decision.Allowed || decision.AgentID != "agt_42" {
+			t.Errorf("decision = %+v", decision)
+		}
+	})
+
+	errorCases := []struct {
+		name   string
+		status int
+		body   any
+		kind   error
+		code   string
+	}{
+		{"403 agent_required", 403, map[string]any{"error": "agent_required"}, ErrPermissionDenied, "agent_required"},
+		{"404 unknown_server", 404, map[string]any{"error": "unknown_server"}, ErrNotFound, "unknown_server"},
+		{"400 invalid_request", 400, map[string]any{"error": "invalid_request"}, ErrAPI, "invalid_request"},
+	}
+	for _, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got capture
+			var header http.Header
+			client, _ := newTestClient(t, mcpDecisionServer(t, &got, &header, tc.status, tc.body),
+				WithAccessToken("tok"))
+			decision, err := client.Agents.AuthorizeMcpTool(ctx, "mcp_0123456789abcdef01234567", "send_invoice")
+			if decision != nil || !errors.Is(err, tc.kind) || ErrorCode(err) != tc.code {
+				t.Fatalf("got decision %+v, err %v (code %q); want %v / %q",
+					decision, err, ErrorCode(err), tc.kind, tc.code)
+			}
+		})
+	}
+
+	t.Run("client-side validation", func(t *testing.T) {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Error("no request should have been sent")
+		}, WithAccessToken("tok"))
+		cases := [][2]string{
+			{"", "send_invoice"},
+			{"mcp_1", ""},
+			{"https://mcp.example.com/mcp", "send_invoice"},
+			{"mcp_1", "a/b"},
+			{"mcp_1", "a:b"},
+			{"mcp_1", "a*"},
+			{"mcp_1", strings.Repeat("x", 81)},
+		}
+		for _, c := range cases {
+			if _, err := client.Agents.AuthorizeMcpTool(ctx, c[0], c[1]); !errors.Is(err, ErrValidation) {
+				t.Errorf("%q/%q: expected a validation error, got %v", c[0], c[1], err)
+			}
+		}
+	})
+
+	t.Run("Agent.AuthorizeMcpTool uses the agent's own token", func(t *testing.T) {
+		var calls []capture
+		agent, _ := newTestAgent(t, func(w http.ResponseWriter, r *http.Request) {
+			calls = append(calls, capture{Method: r.Method, Path: r.URL.Path})
+			if strings.HasSuffix(r.URL.Path, "/oauth/token") {
+				writeJSON(w, 200, map[string]any{"access_token": "agent-at", "expires_in": 3600})
+				return
+			}
+			if r.Header.Get("Authorization") != "Bearer agent-at" {
+				t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+			}
+			writeJSON(w, 403, body(false))
+		})
+		decision, err := agent.AuthorizeMcpTool(ctx, "mcp_0123456789abcdef01234567", "send_invoice")
+		if err != nil || decision.Allowed {
+			t.Fatalf("decision %+v, err %v", decision, err)
+		}
+		if len(calls) != 2 || calls[1].Path != "/orgs/acme-corp/api/v1/agents/me/mcp/authorize" {
+			t.Errorf("calls = %+v", calls)
+		}
+	})
+}
+
+// equalJSON compares two values after a JSON round trip.
+func equalJSON(a, b any) bool {
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(ja) == string(jb)
+}
+
 // ── Auth ──────────────────────────────────────────────────────────────
 
 func TestAuthResource(t *testing.T) {
