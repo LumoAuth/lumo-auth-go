@@ -435,7 +435,7 @@ func TestJITContextStatusAndPending(t *testing.T) {
 	var calls []capture
 	jit := newTestJIT(t, recordingHandler(t, &calls,
 		map[string]any{"request_id": "req_1", "status": "approved"},
-		map[string]any{"requests": []map[string]any{{"request_id": "req_2", "status": "pending"}}},
+		map[string]any{"data": []map[string]any{{"request_id": "req_2"}}, "count": 1},
 	))
 
 	ctx := context.Background()

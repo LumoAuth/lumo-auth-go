@@ -44,10 +44,12 @@ func ExampleZanzibarResource_Check() {
 	fmt.Println(allowed)
 }
 
-// ABAC decisions carry the policies that produced them.
+// ABAC decisions carry the policies that produced them. ABAC routes refuse
+// an organization API key: they need a user access token with the
+// abac:read scope (abac:write for writes).
 func ExampleAbacResource_Check() {
 	client, _ := lumoauth.New(
-		lumoauth.WithAPIKey(os.Getenv("LUMOAUTH_API_KEY")),
+		lumoauth.WithAccessToken(os.Getenv("LUMOAUTH_ACCESS_TOKEN")), // a user token with abac:read
 		lumoauth.WithOrgID("acme-corp"),
 	)
 
@@ -130,12 +132,17 @@ func ExampleApprovalsResource_Require() {
 	case errors.Is(err, lumoauth.ErrApprovalTimeout):
 		fmt.Println("nobody responded in time")
 		return
+	case errors.Is(err, lumoauth.ErrApprovalNotDelivered):
+		// No push device received the request. Reason is
+		// ApprovalReasonEmailFallbackSent or ApprovalReasonNoEnrolledDevice.
+		fmt.Println("ask the user to check their email or enrol a device")
+		return
 	case err != nil:
 		log.Fatal(err)
 	}
 
 	// approval.Token authorises the side-effecting call.
-	fmt.Println("approved by", approval.ApprovedBy.Email)
+	fmt.Println("approved by user", approval.ApprovedBy.UserID)
 }
 
 // A JIT task scopes permissions to one unit of work, and revokes every

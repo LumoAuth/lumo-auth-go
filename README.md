@@ -287,12 +287,19 @@ other subjects: the `authz.check` permission or the `authz:check` scope.
 ### Check attribute policies (ABAC)
 
 ABAC policies grant or deny access based on attributes of the user, the resource and the
-request. ABAC
-calls are made per organization, so the client needs an org ID. They need a user access token
+request. ABAC calls are made per organization, so the client needs an org ID. They need a user access token
 with `abac:read` (checks and reads) or `abac:write` (writes). Organization API keys are not
 accepted on these routes.
 
 ```go
+client, err := lumoauth.New(
+    lumoauth.WithAccessToken(userAccessToken), // a user token with abac:read
+    lumoauth.WithOrgID("acme-corp"),
+)
+if err != nil {
+    return err
+}
+
 decision, err := client.Abac.Check(ctx, lumoauth.AbacCheckParams{
     ResourceType: "document",
     Action:       "read",
@@ -562,6 +569,8 @@ case errors.Is(err, lumoauth.ErrApprovalDenied):
     return fmt.Errorf("the user declined the transfer")
 case errors.Is(err, lumoauth.ErrApprovalTimeout):
     return fmt.Errorf("nobody answered in time")
+case errors.Is(err, lumoauth.ErrApprovalNotDelivered):
+    return fmt.Errorf("no phone got the request; ask the user to check their email")
 case err != nil:
     return err
 }
@@ -582,12 +591,34 @@ result, err := agent.Approvals.Wait(ctx, pending.Token, nil)
 if result.Approved() { /* ... */ }
 ```
 
-Two server rules apply:
+Some requests never reach a phone. The SDK reports them as follows:
 
-- A portal test token cannot create approvals. The server answers 403
-  `test_token_not_accepted`.
-- When the user has no enrolled device, the server emails them a notification instead and
-  answers 202 with the status `email_fallback_sent`. The email does not contain a sign-in link.
+- If the user has no enrolled push device, the server sends them an email notice. The email
+  has no approval link, so nobody can approve the action in this call. `Create` returns a
+  result with the status `lumoauth.ApprovalEmailFallbackSent` and an empty `Token`. There is
+  nothing to poll. `Require` does not poll either. It returns an `*ApprovalError` with the
+  code `APPROVAL_NOT_DELIVERED` and the reason `email_fallback_sent`. The server gives the
+  same answer for an unknown user, so the endpoint does not reveal who has an account.
+- If the user has no device and the email could not be sent, the server answers 428.
+  `Create` and `Require` both return an `*ApprovalError` with the code
+  `APPROVAL_NOT_DELIVERED` and the reason `no_enrolled_device`.
+
+Neither case counts as approval. Tell the user to check their email or to enrol a device:
+
+```go
+var approvalErr *lumoauth.ApprovalError
+if errors.As(err, &approvalErr) && approvalErr.Code == lumoauth.CodeApprovalNotDelivered {
+    switch approvalErr.Reason {
+    case lumoauth.ApprovalReasonEmailFallbackSent:
+        // An email notice went out. Ask the user to enrol a device, then try again.
+    case lumoauth.ApprovalReasonNoEnrolledDevice:
+        // Nothing reached the user. Ask them to enrol a device.
+    }
+}
+```
+
+A portal test token cannot create approvals. The server answers 403
+`test_token_not_accepted`.
 
 ### Just-in-Time permissions
 
@@ -720,8 +751,13 @@ An MCP server that is secured by LumoAuth accepts only tokens issued for it. Exc
 agent's token for one:
 
 ```go
-token, err := agent.MCPToken(ctx, "urn:mcp:financial-data")
+token, err := agent.MCPToken(ctx, "https://mcp.example.com/mcp")
 ```
+
+The server ID is the MCP server's https URL. The SDK sends it as the RFC 8707 `resource`
+parameter, and LumoAuth sets the token's `aud` to it. A plain `http` URL works only for
+localhost and private hosts. An ID such as `urn:mcp:financial-data` cannot be bound to a
+server, so the SDK returns a `ValidationError` before it sends the request.
 
 With a plain `Client`, call `client.Mcp.Token(ctx, serverID, subjectToken)`. Pass an empty
 `subjectToken` to exchange the client's own bearer token. `TokenDetailed` returns the full
@@ -933,6 +969,7 @@ case err != nil:
 | `ErrNetwork` | The request failed before a response arrived | `NETWORK_ERROR` |
 | `ErrApprovalDenied` | A person declined an approval | `APPROVAL_DENIED` |
 | `ErrApprovalTimeout` | An approval expired before anyone answered | `APPROVAL_TIMEOUT` |
+| `ErrApprovalNotDelivered` | No push device got the approval request; see `ApprovalError.Reason` | `APPROVAL_NOT_DELIVERED` |
 | `ErrBudgetExceeded` | The agent's daily budget is used up | `BUDGET_EXCEEDED` |
 
 `*APIError` has these fields:
@@ -1022,7 +1059,7 @@ API keys are not accepted on ABAC routes.
 | Method | What it does |
 | --- | --- |
 | `Require(ctx, params, opts)` | Create an approval and wait for the answer; any answer other than approval is an error |
-| `Create(ctx, params)` | Create an approval and return at once |
+| `Create(ctx, params)` | Create an approval and return at once; the status is `email_fallback_sent` with no token when no device got it |
 | `Status(ctx, token)` | Read the current state |
 | `Wait(ctx, token, opts)` | Poll until the approval is answered or expires |
 
@@ -1053,7 +1090,7 @@ All of them need an agent credential. Portal test tokens are refused.
 
 | Method | What it does |
 | --- | --- |
-| `Token(ctx, serverID, subjectToken)` | A token for one MCP server |
+| `Token(ctx, serverID, subjectToken)` | A token for one MCP server; `serverID` is the server's https URL |
 | `TokenDetailed(...)` | The same, with the full response |
 
 ### Package functions
@@ -1083,6 +1120,9 @@ All of them need an agent credential. Portal test tokens are refused.
 | `invalid_grant` from a token exchange | The declared token type does not match the token, the subject is no longer active, or the subject is a JIT token | Set `SubjectTokenType` correctly (for example `TokenTypeIDToken` for an ID token), and exchange an active user's token |
 | 400 `invalid_request` when an agent exchanges a refresh token for a user | A refresh token cannot be the subject of an on-behalf-of exchange | Exchange the user's access token or ID token |
 | 403 `test_token_not_accepted` from `Approvals.Create` | The agent uses a test token from the portal | Use the agent's real credential |
+| `ErrApprovalNotDelivered` from `Approvals.Require` | The user has no enrolled push device | Ask the user to enrol a device in the LumoAuth app, then try again |
+| `ValidationError` from `Mcp.Token` about the server ID | The ID is not an http(s) URL, for example `urn:mcp:…` | Pass the MCP server's https URL, for example `https://mcp.example.com/mcp` |
+| 400 `invalid_target` from `Mcp.Token` | The server URL uses plain `http` on a public host, or has a fragment | Use an `https` URL with no `#` part |
 | `ErrRateLimited` | Too many requests | Wait for `APIError.RetryAfter`, then retry |
 | `ErrConfig` mentioning the organization | The call needs an org ID | Set `WithOrgID` or `LUMOAUTH_ORG_ID` |
 | The session is lost after every restart | `SessionSecret` changes at each start | Load a fixed secret from your configuration |

@@ -747,6 +747,36 @@ func TestJitResource(t *testing.T) {
 		}
 	})
 
+	t.Run("Pending reads data from the server envelope", func(t *testing.T) {
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
+			"data":       []map[string]any{{"request_id": "req_data"}},
+			"count":      1,
+			"pagination": map[string]any{"has_more": false},
+			// An older alias the server still sends; data wins.
+			"pending_requests": []map[string]any{{"request_id": "req_alias"}},
+		}))
+		got, err := client.Jit.Pending(ctx)
+		if err != nil {
+			t.Fatalf("Pending: %v", err)
+		}
+		if len(got) != 1 || got[0].RequestID != "req_data" {
+			t.Errorf("pending = %+v, want the data entry", got)
+		}
+
+		var aliasCalls []capture
+		aliasClient, _ := newTestClient(t, recordingHandler(t, &aliasCalls, map[string]any{
+			"pending_requests": []map[string]any{{"request_id": "req_alias"}},
+		}))
+		got, err = aliasClient.Jit.Pending(ctx)
+		if err != nil {
+			t.Fatalf("Pending (alias): %v", err)
+		}
+		if len(got) != 1 || got[0].RequestID != "req_alias" {
+			t.Errorf("pending = %+v, want the pending_requests entry", got)
+		}
+	})
+
 	t.Run("Pending accepts both response shapes", func(t *testing.T) {
 		requests := []map[string]any{{"request_id": "req_1", "status": "pending"}}
 
@@ -841,6 +871,119 @@ func TestApprovalsResource(t *testing.T) {
 		}
 	})
 
+	t.Run("Create returns the email fallback status without a token", func(t *testing.T) {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, 202, map[string]any{
+				"status":  "email_fallback_sent",
+				"message": "The user has no push device; an email notice was sent.",
+				"task_id": "wire-001",
+				"impact":  "high",
+			})
+		})
+
+		result, err := client.Approvals.Create(ctx, ApprovalParams{
+			TaskID: "wire-001", Reason: "Wire funds", OnBehalfOf: "ada@acme.com",
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if result.Status != ApprovalEmailFallbackSent || result.Token != "" {
+			t.Errorf("result = %+v, want email_fallback_sent and no token", result)
+		}
+		if result.Approved() {
+			t.Error("an email fallback must never count as approval")
+		}
+	})
+
+	t.Run("Require raises not delivered on the email fallback and does not poll", func(t *testing.T) {
+		var requests int
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if strings.HasSuffix(r.URL.Path, "/status") {
+				t.Error("Require must not poll when no approval token was issued")
+			}
+			writeJSON(w, 202, map[string]any{
+				"status":  "email_fallback_sent",
+				"message": "an email notice was sent",
+				"task_id": "wire-001",
+			})
+		})
+
+		result, err := client.Approvals.Require(ctx, ApprovalParams{
+			TaskID: "wire-001", Reason: "Wire funds", OnBehalfOf: "ada@acme.com",
+		}, &WaitOptions{PollInterval: time.Millisecond, Timeout: time.Second})
+		if !errors.Is(err, ErrApprovalNotDelivered) {
+			t.Fatalf("expected ErrApprovalNotDelivered, got %v", err)
+		}
+		var approvalErr *ApprovalError
+		if !errors.As(err, &approvalErr) {
+			t.Fatalf("expected *ApprovalError, got %T", err)
+		}
+		if approvalErr.Code != CodeApprovalNotDelivered || approvalErr.Reason != ApprovalReasonEmailFallbackSent {
+			t.Errorf("code = %q, reason = %q", approvalErr.Code, approvalErr.Reason)
+		}
+		if approvalErr.TaskID != "wire-001" {
+			t.Errorf("task id = %q", approvalErr.TaskID)
+		}
+		if result != nil && result.Approved() {
+			t.Error("an email fallback must never count as approval")
+		}
+		if requests != 1 {
+			t.Errorf("requests = %d, want only the create call", requests)
+		}
+	})
+
+	t.Run("428 no_enrolled_device raises not delivered", func(t *testing.T) {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, 428, map[string]any{
+				"error":   "no_enrolled_device",
+				"message": "The user has no enrolled device and the email could not be sent.",
+			})
+		})
+
+		for name, call := range map[string]func() error{
+			"Create": func() error {
+				_, err := client.Approvals.Create(ctx, ApprovalParams{
+					TaskID: "wire-001", Reason: "Wire funds", OnBehalfOf: "ada@acme.com",
+				})
+				return err
+			},
+			"Require": func() error {
+				_, err := client.Approvals.Require(ctx, ApprovalParams{
+					TaskID: "wire-001", Reason: "Wire funds", OnBehalfOf: "ada@acme.com",
+				}, nil)
+				return err
+			},
+		} {
+			err := call()
+			var approvalErr *ApprovalError
+			if !errors.As(err, &approvalErr) {
+				t.Fatalf("%s: expected *ApprovalError, got %T %v", name, err, err)
+			}
+			if approvalErr.Code != CodeApprovalNotDelivered || approvalErr.Reason != ApprovalReasonNoEnrolledDevice {
+				t.Errorf("%s: code = %q, reason = %q", name, approvalErr.Code, approvalErr.Reason)
+			}
+			if approvalErr.TaskID != "wire-001" {
+				t.Errorf("%s: task id = %q", name, approvalErr.TaskID)
+			}
+			if errors.Is(err, ErrAPI) || !errors.Is(err, ErrLumoAuth) {
+				t.Errorf("%s: should match ErrLumoAuth and ErrApprovalNotDelivered only", name)
+			}
+		}
+	})
+
+	t.Run("other API errors pass through", func(t *testing.T) {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, 403, map[string]any{"error": "delegation_not_permitted"})
+		})
+		_, err := client.Approvals.Create(ctx, ApprovalParams{
+			TaskID: "t", Reason: "r", OnBehalfOf: "ada@acme.com",
+		})
+		if !errors.Is(err, ErrPermissionDenied) {
+			t.Errorf("expected ErrPermissionDenied, got %v", err)
+		}
+	})
+
 	t.Run("Require returns on approval", func(t *testing.T) {
 		var calls []capture
 		client, _ := newTestClient(t, recordingHandler(t, &calls,
@@ -849,7 +992,7 @@ func TestApprovalsResource(t *testing.T) {
 				"approval_token": "appr_1",
 				"status":         "approved",
 				"task_id":        "wire-001",
-				"approved_by":    map[string]any{"user_id": 7, "email": "ada@acme.com"},
+				"approved_by":    map[string]any{"user_id": 7},
 			},
 		))
 
@@ -862,7 +1005,7 @@ func TestApprovalsResource(t *testing.T) {
 		if !result.Approved() {
 			t.Errorf("result = %+v", result)
 		}
-		if result.ApprovedBy == nil || result.ApprovedBy.Email != "ada@acme.com" {
+		if result.ApprovedBy == nil || result.ApprovedBy.UserID != "7" {
 			t.Errorf("approver = %+v", result.ApprovedBy)
 		}
 	})
@@ -911,13 +1054,13 @@ func TestApprovalsResource(t *testing.T) {
 func TestMcpResource(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("Token exchanges for an audience-scoped token", func(t *testing.T) {
+	t.Run("Token binds the token to the server URL via resource", func(t *testing.T) {
 		var calls []capture
 		client, _ := newTestClient(t, recordingHandler(t, &calls,
 			map[string]any{"access_token": "mcp_token", "expires_in": 600, "token_type": "Bearer"}),
 			WithAccessToken("agent-token"))
 
-		token, err := client.Mcp.Token(ctx, "urn:mcp:financial-data", "")
+		token, err := client.Mcp.Token(ctx, "https://mcp.example.com/mcp", "")
 		if err != nil {
 			t.Fatalf("Token: %v", err)
 		}
@@ -929,7 +1072,10 @@ func TestMcpResource(t *testing.T) {
 		if form.Get("grant_type") != GrantTypeTokenExchange {
 			t.Errorf("grant_type = %q", form.Get("grant_type"))
 		}
-		if form.Get("audience") != "urn:mcp:financial-data" {
+		if form.Get("resource") != "https://mcp.example.com/mcp" {
+			t.Errorf("resource = %q, want the MCP server URL", form.Get("resource"))
+		}
+		if form.Get("audience") != "https://mcp.example.com/mcp" {
 			t.Errorf("audience = %q", form.Get("audience"))
 		}
 		if form.Get("subject_token") != "agent-token" {
@@ -942,7 +1088,7 @@ func TestMcpResource(t *testing.T) {
 		client, _ := newTestClient(t, recordingHandler(t, &calls,
 			map[string]any{"access_token": "mcp_token"}), WithAccessToken("agent-token"))
 
-		if _, err := client.Mcp.Token(ctx, "urn:mcp:data", "explicit-subject"); err != nil {
+		if _, err := client.Mcp.Token(ctx, "https://mcp.example.com/data", "explicit-subject"); err != nil {
 			t.Fatalf("Token: %v", err)
 		}
 		if calls[0].Form.Get("subject_token") != "explicit-subject" {
@@ -956,11 +1102,28 @@ func TestMcpResource(t *testing.T) {
 		})
 
 		// An API-key client has no bearer token to exchange.
-		if _, err := client.Mcp.Token(ctx, "urn:mcp:data", ""); !errors.Is(err, ErrConfig) {
+		if _, err := client.Mcp.Token(ctx, "https://mcp.example.com/data", ""); !errors.Is(err, ErrConfig) {
 			t.Errorf("expected a config error, got %v", err)
 		}
 		if _, err := client.Mcp.Token(ctx, "", "subject"); !errors.Is(err, ErrValidation) {
 			t.Errorf("a missing server ID should be a validation error, got %v", err)
+		}
+	})
+
+	t.Run("Token rejects a server ID that is not an http(s) URL", func(t *testing.T) {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Error("no request should have been sent")
+		}, WithAccessToken("agent-token"))
+
+		for _, id := range []string{"urn:mcp:financial-data", "mcp.example.com", "ftp://mcp.example.com", "https://mcp.example.com/mcp#frag", "https:///mcp"} {
+			_, err := client.Mcp.Token(ctx, id, "")
+			if !errors.Is(err, ErrValidation) {
+				t.Errorf("%q: expected a validation error, got %v", id, err)
+				continue
+			}
+			if !strings.Contains(err.Error(), "https://mcp.example.com/mcp") {
+				t.Errorf("%q: the message should show an https example, got %q", id, err.Error())
+			}
 		}
 	})
 }

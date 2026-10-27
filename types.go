@@ -429,18 +429,29 @@ const (
 	ApprovalApproved = "approved"
 	ApprovalDenied   = "denied"
 	ApprovalExpired  = "expired"
+	// ApprovalEmailFallbackSent is the status Create returns when the user
+	// has no enrolled push device. The server sent an email notice with no
+	// approval link instead. The result has no Token and nothing to poll.
+	ApprovalEmailFallbackSent = "email_fallback_sent"
 )
 
-// Approver identifies the human who responded to an approval request.
+// Approver identifies the human who responded to an approval request. The
+// server sends it as {"user_id": …} on an approved request and null
+// otherwise.
 type Approver struct {
-	UserID ID     `json:"user_id,omitempty"`
-	Email  string `json:"email,omitempty"`
+	UserID ID `json:"user_id,omitempty"`
+	// Email is set only if the server includes it; the current server
+	// sends user_id alone.
+	Email string `json:"email,omitempty"`
 }
 
 // ApprovalResult is the state of a push-approval request.
 type ApprovalResult struct {
-	// Status is "pending", "approved", "denied", or "expired".
+	// Status is "pending", "approved", "denied", or "expired". Create can
+	// also return ApprovalEmailFallbackSent, with an empty Token.
 	Status string `json:"status"`
+	// Message is the server's explanation, when it sends one.
+	Message string `json:"message,omitempty"`
 	// Token is the approval token; present it as the credential for the
 	// side-effecting call the approval authorises.
 	Token       string         `json:"approval_token,omitempty"`

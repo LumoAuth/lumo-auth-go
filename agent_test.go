@@ -292,8 +292,8 @@ func TestAgentMCPToken(t *testing.T) {
 		_ = r.ParseForm()
 		if r.Form.Get("grant_type") == GrantTypeTokenExchange {
 			exchanges++
-			if r.Form.Get("audience") != "urn:mcp:financial-data" {
-				t.Errorf("audience = %q", r.Form.Get("audience"))
+			if r.Form.Get("resource") != "https://mcp.example.com/mcp" {
+				t.Errorf("resource = %q", r.Form.Get("resource"))
 			}
 			if r.Form.Get("subject_token") != "agent-token" {
 				t.Errorf("subject_token = %q, want the agent's token", r.Form.Get("subject_token"))
@@ -304,7 +304,7 @@ func TestAgentMCPToken(t *testing.T) {
 		writeJSON(w, 200, map[string]any{"access_token": "agent-token", "expires_in": 3600})
 	})
 
-	token, err := agent.MCPToken(context.Background(), "urn:mcp:financial-data")
+	token, err := agent.MCPToken(context.Background(), "https://mcp.example.com/mcp")
 	if err != nil {
 		t.Fatalf("MCPToken: %v", err)
 	}

@@ -183,17 +183,27 @@ func (r *JitResource) Pending(ctx context.Context) ([]JitRequest, error) {
 		return nil, err
 	}
 
-	// The endpoint returns either a bare array or an envelope with
-	// `requests`.
+	// The server replies {pending_requests, count, data, pagination}; `data`
+	// is the standard list key and `pending_requests` the older alias. A
+	// bare array is accepted too.
 	var requests []JitRequest
 	if err := json.Unmarshal(raw, &requests); err == nil {
 		return requests, nil
 	}
 	var envelope struct {
-		Requests []JitRequest `json:"requests"`
+		Data            []JitRequest `json:"data"`
+		PendingRequests []JitRequest `json:"pending_requests"`
+		Requests        []JitRequest `json:"requests"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return nil, NewValidationError("could not decode the pending requests response: " + err.Error())
 	}
-	return envelope.Requests, nil
+	switch {
+	case envelope.Data != nil:
+		return envelope.Data, nil
+	case envelope.PendingRequests != nil:
+		return envelope.PendingRequests, nil
+	default:
+		return envelope.Requests, nil
+	}
 }

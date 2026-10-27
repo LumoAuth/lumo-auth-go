@@ -17,7 +17,7 @@ import (
 //	├── ValidationError            (bad input / unexpected response shape)
 //	├── ConfigError                (missing or invalid configuration)
 //	├── NetworkError               (transport failure: DNS, timeout, TLS, …)
-//	├── ApprovalError              (denied / timed out)
+//	├── ApprovalError              (denied / timed out / not delivered)
 //	└── BudgetError                (agent budget exhausted)
 //
 // Errors are matched with the standard library rather than by type switch:
@@ -40,7 +40,10 @@ const (
 	CodeNetwork          = "NETWORK_ERROR"
 	CodeApprovalDenied   = "APPROVAL_DENIED"
 	CodeApprovalTimeout  = "APPROVAL_TIMEOUT"
-	CodeBudgetExceeded   = "BUDGET_EXCEEDED"
+	// CodeApprovalNotDelivered marks an ApprovalError for a request that
+	// never reached a push device; see ApprovalError.Reason.
+	CodeApprovalNotDelivered = "APPROVAL_NOT_DELIVERED"
+	CodeBudgetExceeded       = "BUDGET_EXCEEDED"
 )
 
 // Sentinel errors for errors.Is. Every error returned by this SDK matches
@@ -68,6 +71,9 @@ var (
 	ErrApprovalDenied = errors.New("lumoauth: approval denied")
 	// ErrApprovalTimeout matches an approval that expired before a response.
 	ErrApprovalTimeout = errors.New("lumoauth: approval timed out")
+	// ErrApprovalNotDelivered matches an approval request that no push
+	// device received, so nobody can approve it in this call.
+	ErrApprovalNotDelivered = errors.New("lumoauth: approval not delivered")
 	// ErrBudgetExceeded matches an exhausted agent budget.
 	ErrBudgetExceeded = errors.New("lumoauth: budget exceeded")
 )
@@ -241,12 +247,32 @@ func newNetworkError(message string, cause error) *NetworkError {
 	return &NetworkError{BaseError: err}
 }
 
+// Reasons carried by an ApprovalError with Code CodeApprovalNotDelivered.
+const (
+	// ApprovalReasonEmailFallbackSent means the user has no enrolled push
+	// device, so the server sent an email notice instead. The email holds no
+	// approval link. The server gives the same answer for an unknown user.
+	ApprovalReasonEmailFallbackSent = "email_fallback_sent"
+	// ApprovalReasonNoEnrolledDevice means the user has no enrolled push
+	// device and the server could not send the email notice either.
+	ApprovalReasonNoEnrolledDevice = "no_enrolled_device"
+)
+
 // ApprovalError is returned when a push approval was denied by a human
-// (ErrApprovalDenied) or expired before anyone responded (ErrApprovalTimeout).
+// (ErrApprovalDenied), expired before anyone responded (ErrApprovalTimeout),
+// or never reached a push device (ErrApprovalNotDelivered). Code tells the
+// three apart: CodeApprovalDenied, CodeApprovalTimeout or
+// CodeApprovalNotDelivered.
 type ApprovalError struct {
 	*BaseError
-	// Approval is the last observed approval payload, for audit.
+	// Approval is the last observed approval payload, for audit. It is nil
+	// when the request was not delivered.
 	Approval *ApprovalResult
+	// Reason is set when Code is CodeApprovalNotDelivered:
+	// ApprovalReasonEmailFallbackSent or ApprovalReasonNoEnrolledDevice.
+	Reason string
+	// TaskID is the task the request named, when the server echoed it.
+	TaskID string
 }
 
 func newApprovalDenied(result *ApprovalResult) *ApprovalError {
@@ -261,6 +287,26 @@ func newApprovalTimeout(result *ApprovalResult) *ApprovalError {
 		BaseError: newError(ErrApprovalTimeout, CodeApprovalTimeout,
 			"approval timed out before the user responded"),
 		Approval: result,
+	}
+}
+
+// newApprovalNotDelivered builds the not-delivered error. message is the
+// server's explanation, or "" for a default one.
+func newApprovalNotDelivered(reason, message, taskID string) *ApprovalError {
+	if message != "" {
+		message = "approval was not delivered: " + message
+	} else {
+		switch reason {
+		case ApprovalReasonEmailFallbackSent:
+			message = "approval was not delivered: the user has no enrolled push device, so an email notice was sent instead"
+		default:
+			message = "approval was not delivered: the user has no enrolled push device"
+		}
+	}
+	return &ApprovalError{
+		BaseError: newError(ErrApprovalNotDelivered, CodeApprovalNotDelivered, message),
+		Reason:    reason,
+		TaskID:    taskID,
 	}
 }
 

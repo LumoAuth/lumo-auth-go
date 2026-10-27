@@ -1,19 +1,25 @@
 package lumoauth
 
-import "context"
+import (
+	"context"
+	"net/url"
+)
 
-// McpResource exchanges the caller's token for one scoped to a secured MCP
-// server (RFC 8693, with the server id as the audience).
+// McpResource exchanges the caller's token for one bound to a secured MCP
+// server (RFC 8693 token exchange). The server's URL goes in the RFC 8707
+// `resource` parameter, which sets the issued token's `aud`.
 type McpResource struct {
 	http *httpClient
 	auth *AuthResource
 }
 
-// Token returns an access token scoped to one MCP server.
+// Token returns an access token bound to one MCP server.
 //
-//	token, err := client.Mcp.Token(ctx, "urn:mcp:financial-data", "")
+//	token, err := client.Mcp.Token(ctx, "https://mcp.example.com/mcp", "")
 //
-// serverID is the audience identifier of the target server. Pass an empty
+// serverID is the MCP server's https URL, which is its RFC 8707 resource
+// identifier. LumoAuth sets the token's `aud` from it. A plain-http URL is
+// accepted only for localhost and private hosts. Pass an empty
 // subjectToken to exchange the client's own bearer token.
 func (r *McpResource) Token(ctx context.Context, serverID, subjectToken string) (string, error) {
 	result, err := r.TokenDetailed(ctx, serverID, subjectToken)
@@ -26,9 +32,8 @@ func (r *McpResource) Token(ctx context.Context, serverID, subjectToken string) 
 // TokenDetailed is Token with the full token response — lifetime, type,
 // and granted scope.
 func (r *McpResource) TokenDetailed(ctx context.Context, serverID, subjectToken string) (*McpToken, error) {
-	if serverID == "" {
-		return nil, NewValidationError(
-			`a server ID is required (the MCP server's audience, e.g. "urn:mcp:financial-data")`)
+	if err := validateMcpServerID(serverID); err != nil {
+		return nil, err
 	}
 
 	token := subjectToken
@@ -46,6 +51,7 @@ func (r *McpResource) TokenDetailed(ctx context.Context, serverID, subjectToken 
 
 	response, err := r.auth.TokenExchange(ctx, TokenExchangeParams{
 		SubjectToken: token,
+		Resource:     serverID,
 		Audience:     serverID,
 	})
 	if err != nil {
@@ -57,4 +63,20 @@ func (r *McpResource) TokenDetailed(ctx context.Context, serverID, subjectToken 
 		ExpiresIn:   response.ExpiresIn,
 		Scope:       response.Scope,
 	}, nil
+}
+
+// validateMcpServerID checks that serverID can serve as an RFC 8707
+// resource: an absolute http(s) URI with a host and no fragment. The server
+// enforces the stricter rule (https, or http only for localhost and
+// private hosts) and answers 400 invalid_target otherwise.
+func validateMcpServerID(serverID string) error {
+	const hint = `the MCP server ID must be the server's https URL (its RFC 8707 resource identifier), e.g. "https://mcp.example.com/mcp"`
+	if serverID == "" {
+		return NewValidationError("a server ID is required: " + hint)
+	}
+	u, err := url.Parse(serverID)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Fragment != "" || u.RawFragment != "" {
+		return validationErrorf("invalid MCP server ID %q: %s", serverID, hint)
+	}
+	return nil
 }

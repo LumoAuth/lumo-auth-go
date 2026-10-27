@@ -378,8 +378,9 @@ func (a *Agent) Register(ctx context.Context, params RegisterParams) (*AgentRegi
 	return a.Agents.Register(ctx, params)
 }
 
-// MCPToken exchanges the agent's token for one scoped to a secured MCP
-// server.
+// MCPToken exchanges the agent's token for one bound to a secured MCP
+// server. serverID is the server's https URL, e.g.
+// "https://mcp.example.com/mcp"; see McpResource.Token.
 func (a *Agent) MCPToken(ctx context.Context, serverID string) (string, error) {
 	return a.Mcp.Token(ctx, serverID, "")
 }

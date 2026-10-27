@@ -122,7 +122,8 @@ func TestContractErrorCodes(t *testing.T) {
 	codes := map[string]bool{
 		CodeError: true, CodeAPI: true, CodeAuthentication: true, CodePermissionDenied: true,
 		CodeNotFound: true, CodeRateLimited: true, CodeValidation: true, CodeConfig: true,
-		CodeNetwork: true, CodeApprovalDenied: true, CodeApprovalTimeout: true, CodeBudgetExceeded: true,
+		CodeNetwork: true, CodeApprovalDenied: true, CodeApprovalTimeout: true, CodeApprovalNotDelivered: true,
+		CodeBudgetExceeded: true,
 	}
 	for _, e := range contract.Errors {
 		if !codes[e.Code] {

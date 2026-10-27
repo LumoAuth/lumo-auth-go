@@ -32,7 +32,17 @@ It exposes four entry points, one per kind of caller:
 
 	ok, err := client.Permissions.Check(ctx, "document.edit", nil)
 	ok, err = client.Zanzibar.IsViewer(ctx, "document:readme", "user:bob")
-	decision, err := client.Abac.Check(ctx, lumoauth.AbacCheckParams{
+
+An organization API key works only on the admin API, client registration
+and the permission checks. ABAC, agent and JIT routes refuse it. Call ABAC
+with a user access token that has the abac:read scope (abac:write for
+writes):
+
+	userClient, err := lumoauth.New(
+	    lumoauth.WithAccessToken(userAccessToken), // has abac:read
+	    lumoauth.WithOrgID("acme-corp"),
+	)
+	decision, err := userClient.Abac.Check(ctx, lumoauth.AbacCheckParams{
 	    ResourceType: "document",
 	    Action:       "read",
 	    ResourceID:   "doc-123",
@@ -63,7 +73,7 @@ Before an irreversible action, ask a human:
 	    OnBehalfOf: "ada@acme.com",
 	}, nil)
 	if err != nil {
-	    return err // denied, expired, or the wait timed out
+	    return err // denied, expired, timed out, or not delivered to a device
 	}
 
 For narrowly scoped, short-lived permissions, open a [JITContext]; for

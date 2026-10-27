@@ -63,9 +63,18 @@ func (o *WaitOptions) timeout() time.Duration {
 // Create opens an approval request and returns immediately with the
 // pending approval, whose Token identifies it.
 //
-// A portal test token is refused with 403 test_token_not_accepted. When the
-// user has no enrolled device, the server emails a plain notification with
-// no sign-in link and answers 202 email_fallback_sent.
+// When the user has no enrolled push device, the server emails a plain
+// notice with no approval link and answers 202. Create then returns a
+// result with Status ApprovalEmailFallbackSent and an empty Token. Nothing
+// can be polled, and the action is not approved. Tell the user to check
+// their email or enrol a device. The server gives the same answer for an
+// unknown user, so the endpoint does not reveal who has an account.
+//
+// When the user has no device and the email could not be sent either, the
+// server answers 428. Create returns an *ApprovalError with Code
+// CodeApprovalNotDelivered and Reason ApprovalReasonNoEnrolledDevice.
+//
+// A portal test token is refused with 403 test_token_not_accepted.
 func (r *ApprovalsResource) Create(ctx context.Context, params ApprovalParams) (*ApprovalResult, error) {
 	if params.TaskID == "" {
 		return nil, NewValidationError("TaskID is required")
@@ -96,7 +105,11 @@ func (r *ApprovalsResource) Create(ctx context.Context, params ApprovalParams) (
 
 	var result ApprovalResult
 	if err := r.http.call(ctx, RouteApprovalsCreate, nil, &request{JSON: body}, &result); err != nil {
-		return nil, err
+		return nil, notDeliveredFromAPIError(err, params.TaskID)
+	}
+	if result.Status == ApprovalEmailFallbackSent {
+		result.Token = ""
+		return &result, nil
 	}
 	if result.Token == "" {
 		return nil, NewValidationError("the server did not return an approval_token")
@@ -164,17 +177,28 @@ func (r *ApprovalsResource) Wait(ctx context.Context, approvalToken string, opts
 //	    OnBehalfOf: "ada@acme.com",
 //	}, nil)
 //	if err != nil {
-//	    return err // denied, expired, or the wait timed out
+//	    return err // denied, expired, timed out, or not delivered
 //	}
 //	// approval.Token authorises the side-effecting call.
 //
-// Use errors.Is with ErrApprovalDenied or ErrApprovalTimeout to tell the
-// outcomes apart; the *ApprovalError carries the final payload for audit.
+// Use errors.Is with ErrApprovalDenied, ErrApprovalTimeout or
+// ErrApprovalNotDelivered to tell the outcomes apart; the *ApprovalError
+// carries the final payload for audit. When no push device received the
+// request, the error has Code CodeApprovalNotDelivered and a Reason of
+// ApprovalReasonEmailFallbackSent or ApprovalReasonNoEnrolledDevice.
+// Require does not poll in that case, and it never treats it as approval.
 // To handle a denial without an error, call Create and Wait yourself.
 func (r *ApprovalsResource) Require(ctx context.Context, params ApprovalParams, opts *WaitOptions) (*ApprovalResult, error) {
 	created, err := r.Create(ctx, params)
 	if err != nil {
 		return nil, err
+	}
+	if created.Status == ApprovalEmailFallbackSent {
+		taskID := created.TaskID
+		if taskID == "" {
+			taskID = params.TaskID
+		}
+		return created, newApprovalNotDelivered(ApprovalReasonEmailFallbackSent, created.Message, taskID)
 	}
 
 	result, err := r.Wait(ctx, created.Token, opts)
@@ -190,4 +214,24 @@ func (r *ApprovalsResource) Require(ctx context.Context, params ApprovalParams, 
 		// Pending at the deadline, or expired server-side.
 		return result, newApprovalTimeout(result)
 	}
+}
+
+// notDeliveredFromAPIError turns the server's 428 no_enrolled_device answer
+// into an *ApprovalError. Other errors pass through unchanged. The result
+// does not wrap the *APIError, so it matches only ErrApprovalNotDelivered.
+func notDeliveredFromAPIError(err error, taskID string) error {
+	apiErr, ok := AsAPIError(err)
+	if !ok {
+		return err
+	}
+	body, _ := apiErr.Body.(map[string]any)
+	code, _ := body["error"].(string)
+	if apiErr.StatusCode != 428 && code != ApprovalReasonNoEnrolledDevice {
+		return err
+	}
+	message, _ := body["message"].(string)
+	if echoed, ok := body["task_id"].(string); ok && echoed != "" {
+		taskID = echoed
+	}
+	return newApprovalNotDelivered(ApprovalReasonNoEnrolledDevice, message, taskID)
 }

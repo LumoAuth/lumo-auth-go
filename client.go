@@ -35,9 +35,11 @@ const (
 //	}
 //
 //	ok, err := client.Permissions.Check(ctx, "document.edit", nil)
-//	decision, err := client.Abac.Check(ctx, lumoauth.AbacCheckParams{
-//	    ResourceType: "document", Action: "read", ResourceID: "doc-123",
-//	})
+//
+// An API key reaches only the admin API, client registration and the
+// permission checks. ABAC, agent and JIT calls need a user access token
+// (WithAccessToken or WithTokenProvider) or an agent credential; ABAC
+// needs the abac:read scope.
 //
 // A Client is safe for concurrent use.
 type Client struct {
