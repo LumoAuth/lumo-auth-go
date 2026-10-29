@@ -206,6 +206,10 @@ type ValidationError struct {
 	*BaseError
 	// Issues holds per-field detail when the server supplied it.
 	Issues []any
+	// Reason is a stable, machine-readable cause set by the token
+	// verifiers (one of the TokenRejected* constants); "" elsewhere. Read
+	// it with RejectionReason.
+	Reason string
 }
 
 // NewValidationError builds a ValidationError. Exported so callers writing

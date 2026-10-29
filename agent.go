@@ -44,6 +44,12 @@ type AgentConfig struct {
 	HTTPClient *http.Client
 	// SkipCertValidation disables TLS verification. Local development only.
 	SkipCertValidation bool
+	// DPoP binds the agent's tokens to a key (RFC 9449). The client
+	// credentials grant, MCP token exchanges and delegation exchanges then
+	// send a DPoP proof, the tokens come back with token_type "DPoP", and
+	// the agent presents them with the DPoP scheme. Needed for MCP servers
+	// registered with "Require DPoP". See NewDPoPSigner.
+	DPoP *DPoPSigner
 }
 
 // Agent is the client for an AI agent acting under its own identity.
@@ -99,6 +105,7 @@ type Agent struct {
 	mu          sync.Mutex
 	refreshMu   sync.Mutex
 	accessToken string
+	tokenType   string
 	refreshAt   time.Time
 	tokenScopes []string
 	identity    *AgentIdentity
@@ -133,6 +140,7 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 		httpClient:         cfg.HTTPClient,
 		skipCertValidation: cfg.SkipCertValidation,
 		userAgent:          userAgent(),
+		dpop:               cfg.DPoP,
 	})
 
 	agent.Agents = agent.client.Agents
@@ -165,6 +173,10 @@ func (a *Agent) ClientSecret() string { return a.clientSecret }
 // RedirectURI returns the configured OAuth callback URL.
 func (a *Agent) RedirectURI() string { return a.redirectURI }
 
+// DPoP returns the signer from AgentConfig.DPoP, or nil when the agent's
+// tokens are plain bearer tokens.
+func (a *Agent) DPoP() *DPoPSigner { return a.client.DPoP() }
+
 // ── Authentication ────────────────────────────────────────────────────
 
 // Authenticate performs the client-credentials grant and caches the token.
@@ -190,6 +202,7 @@ func (a *Agent) Authenticate(ctx context.Context, scopes ...string) (string, err
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.accessToken = token.AccessToken
+	a.tokenType = tokenTypeOrBearer(token.TokenType)
 	a.refreshAt = time.Now().Add(expiresIn - tokenRefreshBuffer)
 	a.tokenScopes = token.Scopes()
 	return a.accessToken, nil
@@ -231,6 +244,15 @@ func (a *Agent) cachedToken() (string, bool) {
 		return a.accessToken, true
 	}
 	return "", false
+}
+
+// TokenType returns the token_type of the cached token: "Bearer", or
+// "DPoP" when AgentConfig.DPoP bound it to a key. It is "" before the first
+// authentication.
+func (a *Agent) TokenType() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tokenType
 }
 
 // TokenScopes returns the scopes granted by the last authentication.
@@ -405,6 +427,15 @@ func (a *Agent) Do(ctx context.Context, method, path string, body, out any) erro
 // *http.Response and must close its body.
 func (a *Agent) DoRaw(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	return a.client.DoRaw(ctx, method, path, body)
+}
+
+// tokenTypeOrBearer normalises a token_type for comparison: "DPoP" for a
+// bound token, "Bearer" otherwise (the field is optional on the wire).
+func tokenTypeOrBearer(tokenType string) string {
+	if strings.EqualFold(tokenType, DPoPTokenType) {
+		return DPoPTokenType
+	}
+	return "Bearer"
 }
 
 func firstNonEmpty(values ...string) string {

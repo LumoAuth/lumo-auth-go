@@ -32,6 +32,9 @@ type httpClient struct {
 	timeout       time.Duration
 	userAgent     string
 	headers       map[string]string
+	// dpop, when set, binds token requests to its key and presents bound
+	// tokens with the DPoP scheme plus a proof (RFC 9449).
+	dpop *DPoPSigner
 }
 
 // TokenProvider returns the bearer token to authenticate a request with. It
@@ -133,30 +136,38 @@ func (c *httpClient) orgPath(path string) (string, error) {
 // the status onto the error taxonomy, and decodes JSON into out. out may be
 // nil to discard the body.
 func (c *httpClient) do(ctx context.Context, method, pathOrURL string, req *request, out any) error {
+	_, err := c.doHeaders(ctx, method, pathOrURL, req, out)
+	return err
+}
+
+// doHeaders is do, also returning the response headers whenever a response
+// was received — on success and on an *APIError alike. The token endpoint
+// reads DPoP-Nonce out of them.
+func (c *httpClient) doHeaders(ctx context.Context, method, pathOrURL string, req *request, out any) (http.Header, error) {
 	resp, err := c.doRaw(ctx, method, pathOrURL, req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
-		return newNetworkError(
+		return resp.Header, newNetworkError(
 			fmt.Sprintf("reading response from %s failed: %v", pathOrURL, readErr), readErr)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return apiErrorFromResponse(resp, body)
+		return resp.Header, apiErrorFromResponse(resp, body)
 	}
 
 	if out == nil || resp.StatusCode == http.StatusNoContent || len(bytes.TrimSpace(body)) == 0 {
-		return nil
+		return resp.Header, nil
 	}
 	if err := json.Unmarshal(body, out); err != nil {
-		return NewValidationError(fmt.Sprintf(
+		return resp.Header, NewValidationError(fmt.Sprintf(
 			"could not decode the response from %s: %v", pathOrURL, err))
 	}
-	return nil
+	return resp.Header, nil
 }
 
 // doRaw performs the request and returns the response untouched. Transport
@@ -229,6 +240,11 @@ func (c *httpClient) doRaw(ctx context.Context, method, pathOrURL string, req *r
 	if err != nil {
 		return nil, newNetworkError(fmt.Sprintf("request to %s failed: %v", target, err), err)
 	}
+	if c.dpop != nil {
+		// A server that uses DPoP nonces hands out the next one on every
+		// response; the following proof for that origin must carry it.
+		c.dpop.RememberNonce(resp)
+	}
 	return resp, nil
 }
 
@@ -238,7 +254,15 @@ func (c *httpClient) injectCredentials(ctx context.Context, httpReq *http.Reques
 	if req.NoAuth {
 		return nil
 	}
-	if httpReq.Header.Get("Authorization") != "" || httpReq.Header.Get("X-API-Key") != "" {
+	if authorization := httpReq.Header.Get("Authorization"); authorization != "" {
+		// A caller-supplied bearer token that turns out to be DPoP-bound
+		// still needs the proof, or the server refuses it as a replay.
+		if token, ok := strings.CutPrefix(authorization, "Bearer "); ok {
+			return c.presentToken(httpReq, token)
+		}
+		return nil
+	}
+	if httpReq.Header.Get("X-API-Key") != "" {
 		return nil
 	}
 	if c.tokenProvider != nil {
@@ -247,8 +271,7 @@ func (c *httpClient) injectCredentials(ctx context.Context, httpReq *http.Reques
 			return err
 		}
 		if token != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+token)
-			return nil
+			return c.presentToken(httpReq, token)
 		}
 	}
 	if c.apiKey != "" {
@@ -257,6 +280,17 @@ func (c *httpClient) injectCredentials(ctx context.Context, httpReq *http.Reques
 		httpReq.Header.Set("X-API-Key", c.apiKey)
 	}
 	return nil
+}
+
+// presentToken sets the Authorization header for an access token: the DPoP
+// scheme plus a proof when a signer is configured and the token is bound to
+// a key (cnf.jkt), the Bearer scheme otherwise.
+func (c *httpClient) presentToken(httpReq *http.Request, token string) error {
+	if c.dpop == nil || !DPoPBound(token) {
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		return nil
+	}
+	return c.dpop.AuthorizeRequest(httpReq, token)
 }
 
 // apiErrorFromResponse builds the typed error for a non-2xx response.

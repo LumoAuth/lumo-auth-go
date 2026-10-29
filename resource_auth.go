@@ -2,6 +2,7 @@ package lumoauth
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 )
 
@@ -292,15 +293,56 @@ func (r *AuthResource) UserInfo(ctx context.Context, accessToken string) (*UserI
 // tokenRequest posts to the token endpoint. Token endpoints authenticate
 // through the form body, so the client's own credentials are never
 // injected — sending both would be ambiguous.
+//
+// With a DPoP signer configured, the request carries a proof over the token
+// endpoint (RFC 9449 §5). A 400 use_dpop_nonce answer is retried once with
+// the DPoP-Nonce the server supplied; the nonce from any answer is kept for
+// the following proofs.
 func (r *AuthResource) tokenRequest(ctx context.Context, form url.Values) (*TokenResponse, error) {
 	var token TokenResponse
-	if err := r.http.call(ctx, RouteOAuthToken, nil, &request{Form: form, NoAuth: true}, &token); err != nil {
+	if r.http.dpop == nil {
+		if err := r.http.call(ctx, RouteOAuthToken, nil, &request{Form: form, NoAuth: true}, &token); err != nil {
+			return nil, err
+		}
+		return checkTokenResponse(&token)
+	}
+
+	tokenURL, err := r.http.dpopTokenURL()
+	if err != nil {
 		return nil, err
 	}
+	for attempt := 0; ; attempt++ {
+		proof, err := r.http.dpop.Proof(http.MethodPost, tokenURL)
+		if err != nil {
+			return nil, err
+		}
+		req := &request{Form: form, NoAuth: true, Headers: map[string]string{DPoPHeader: proof}}
+		headers, err := r.http.doHeaders(ctx, http.MethodPost, tokenURL, req, &token)
+		if err == nil {
+			return checkTokenResponse(&token)
+		}
+		// doRaw already remembered the DPoP-Nonce for this origin; retry
+		// once when that is all the server asked for.
+		if attempt == 0 && isUseDPoPNonce(err) && headers.Get(DPoPNonceHeader) != "" {
+			continue
+		}
+		return nil, err
+	}
+}
+
+// checkTokenResponse rejects a 2xx token response without an access_token.
+func checkTokenResponse(token *TokenResponse) (*TokenResponse, error) {
 	if token.AccessToken == "" {
 		return nil, NewValidationError("the token endpoint returned no access_token")
 	}
-	return &token, nil
+	return token, nil
+}
+
+// isUseDPoPNonce reports whether err is the token endpoint's 400
+// use_dpop_nonce answer (RFC 9449 §8).
+func isUseDPoPNonce(err error) bool {
+	apiErr, ok := AsAPIError(err)
+	return ok && apiErr.StatusCode == http.StatusBadRequest && apiErr.Code == "use_dpop_nonce"
 }
 
 // tokenTypeOrDefault returns the declared RFC 8693 token type, or the

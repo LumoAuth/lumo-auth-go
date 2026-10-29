@@ -16,6 +16,11 @@ It exposes four entry points, one per kind of caller:
     proof-of-possession tokens, and RFC 9421 HTTP message signing.
     [VerifyAuthToken] is the resource-server side of the same protocol.
 
+  - [VerifyAccessToken] and [RequireAccessToken] — for an MCP server or
+    API that receives LumoAuth access tokens: local verification against
+    the organization's keys, including DPoP sender-constraint checks.
+    [DPoPSigner] is the client side of DPoP (RFC 9449).
+
   - [WebAuth] — browser sign-in. Wires the OAuth 2.1 Authorization Code +
     PKCE flow into any net/http-compatible router, with sessions in a
     signed cookie.

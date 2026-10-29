@@ -29,8 +29,12 @@ type McpResource struct {
 // the client's own bearer token.
 //
 // The token works only at that MCP server. LumoAuth's own API refuses it.
-// This method does not send a DPoP proof, so an MCP server that requires
-// DPoP needs a DPoP-bound exchange instead.
+// With a DPoP signer configured (WithDPoP, or AgentConfig.DPoP), the
+// exchange carries a DPoP proof and the token comes back bound to the key
+// (token_type "DPoP") — which is what an MCP server registered with
+// "Require DPoP" expects. Present it with DPoPSigner.AuthorizeRequest.
+// Without a signer the exchange sends no proof and the token is a plain
+// bearer token.
 func (r *McpResource) Token(ctx context.Context, serverID, subjectToken string) (string, error) {
 	result, err := r.TokenDetailed(ctx, serverID, subjectToken)
 	if err != nil {

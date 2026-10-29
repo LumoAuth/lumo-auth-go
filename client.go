@@ -82,6 +82,7 @@ type clientConfig struct {
 	skipCertValidation bool
 	headers            map[string]string
 	userAgent          string
+	dpop               *DPoPSigner
 }
 
 // WithBaseURL sets the LumoAuth instance URL. Defaults to $LUMOAUTH_URL,
@@ -142,6 +143,15 @@ func WithHeader(name, value string) Option {
 	}
 }
 
+// WithDPoP binds the client's token requests to a DPoP key (RFC 9449).
+// Every token the client obtains through client.Auth — client credentials,
+// token exchange, MCP tokens — is then sender-constrained (token_type
+// "DPoP"), and the client presents bound tokens with the DPoP scheme and a
+// fresh proof. See DPoPSigner.
+func WithDPoP(signer *DPoPSigner) Option {
+	return func(c *clientConfig) { c.dpop = signer }
+}
+
 // WithUserAgent overrides the User-Agent sent with every request.
 func WithUserAgent(userAgent string) Option {
 	return func(c *clientConfig) { c.userAgent = userAgent }
@@ -182,6 +192,7 @@ func newClient(cfg *clientConfig) *Client {
 	transport.tokenProvider = cfg.tokenProvider
 	transport.headers = cfg.headers
 	transport.userAgent = cfg.userAgent
+	transport.dpop = cfg.dpop
 
 	if cfg.httpClient != nil {
 		transport.doer = cfg.httpClient
@@ -220,6 +231,9 @@ func (c *Client) BaseURL() string { return c.baseURL }
 
 // OrgID returns the configured organization slug ("" when unset).
 func (c *Client) OrgID() string { return c.orgID }
+
+// DPoP returns the signer passed with WithDPoP, or nil.
+func (c *Client) DPoP() *DPoPSigner { return c.http.dpop }
 
 // ── Escape hatches ────────────────────────────────────────────────────
 
@@ -291,6 +305,11 @@ func (c *Client) APIConfig(ctx context.Context) (*APIConfig, error) {
 		return nil, err
 	}
 	switch {
+	case token != "" && c.http.dpop != nil && DPoPBound(token):
+		return nil, NewConfigError(
+			"the current token is DPoP-bound, and the generated API client cannot sign " +
+				"DPoP proofs — use Client.Do, or configure the generated client with a " +
+				"transport that calls DPoPSigner.AuthorizeRequest on each request")
 	case token != "":
 		headers["Authorization"] = "Bearer " + token
 	case c.apiKey != "":

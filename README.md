@@ -34,6 +34,8 @@ The SDK has the same namespaces and the same error codes as the [JS](../sdk-js) 
   - [Just-in-Time permissions](#just-in-time-permissions)
   - [Act on behalf of a user (delegation)](#act-on-behalf-of-a-user-delegation)
   - [Get a token for an MCP server](#get-a-token-for-an-mcp-server)
+  - [Bind tokens to a key with DPoP](#bind-tokens-to-a-key-with-dpop)
+  - [Verify LumoAuth tokens in your MCP server](#verify-lumoauth-tokens-in-your-mcp-server)
   - [Check access to an MCP tool](#check-access-to-an-mcp-tool)
   - [AAuth: cryptographic agent identity](#aauth-cryptographic-agent-identity)
   - [Verify AAuth tokens on a resource server](#verify-aauth-tokens-on-a-resource-server)
@@ -183,6 +185,7 @@ the token lacks a scope, the server answers 403. The error lists the missing sco
 | `WithHeader(name, value)` | An extra header on every request | none |
 | `WithUserAgent(ua)` | The `User-Agent` header | `lumoauth-go/<version>` |
 | `WithSkipCertValidation()` | Turns off TLS verification. Use it for local development only. | off |
+| `WithDPoP(signer)` | Binds every token the client obtains to a DPoP key, and presents bound tokens with the `DPoP` scheme. See [DPoP](#bind-tokens-to-a-key-with-dpop). | off |
 
 `New` returns a `ConfigError` when no credential is configured. It needs an API key, an
 access token or a token provider.
@@ -208,6 +211,7 @@ A value that you pass in code always wins over the environment variable.
 | `Scopes` | Scopes to request when the agent authenticates | the defaults that are registered for the agent |
 | `RedirectURI` | The callback URL of the consent flow for delegation | none |
 | `Timeout`, `HTTPClient`, `SkipCertValidation` | As for `New` | 30 seconds, a new client, off |
+| `DPoP` | A `*DPoPSigner`; the agent's tokens are then bound to its key | none |
 
 `WebConfig` and `AAuthConfig` are described in [Sign users in](#sign-users-in) and
 [AAuth](#aauth-cryptographic-agent-identity).
@@ -762,12 +766,97 @@ URL. The SDK sends it as the RFC 8707 `resource` parameter, and LumoAuth sets th
 `ValidationError` before it sends the request.
 
 The token names exactly one MCP server, and it works only at that server. LumoAuth's own
-API refuses it. This method sends no DPoP proof. If the MCP server requires DPoP, you need
-an exchange that is bound to a DPoP key.
+API refuses it. An MCP server that is registered with "Require DPoP" accepts only tokens
+that are bound to a key. Give the agent a DPoP signer and the same call returns one; see
+[Bind tokens to a key with DPoP](#bind-tokens-to-a-key-with-dpop).
 
 With a plain `Client`, call `client.Mcp.Token(ctx, serverID, subjectToken)`. Pass an empty
 `subjectToken` to exchange the client's own bearer token. `TokenDetailed` returns the full
-response.
+response, including `TokenType` (`Bearer` or `DPoP`).
+
+### Bind tokens to a key with DPoP
+
+DPoP (RFC 9449) binds a token to a private key that only the agent holds. A stolen token is
+then useless without the key. Generate a signer and pass it to the agent:
+
+```go
+signer, err := lumoauth.NewDPoPSigner() // a fresh P-256 key, ES256 proofs
+agent, err := lumoauth.NewAgent(lumoauth.AgentConfig{DPoP: signer})
+
+mcpToken, err := agent.MCPToken(ctx, "https://mcp.example.com/mcp") // bound to the key
+
+req, _ := http.NewRequestWithContext(ctx, "POST", "https://mcp.example.com/mcp", body)
+if err := signer.AuthorizeRequest(req, mcpToken); err != nil {
+    return err
+}
+// Authorization: DPoP <token>  and  DPoP: <proof with ath>
+```
+
+With a signer in place, the SDK:
+
+- sends a `DPoP` proof with every token request: the client-credentials grant, the MCP and
+  delegation exchanges. The tokens come back with `token_type: "DPoP"`; `agent.TokenType()`
+  reports it.
+- retries a token request once when the server answers `use_dpop_nonce`, and remembers the
+  latest `DPoP-Nonce` of each origin for the following proofs.
+- presents a bound token with the `DPoP` authorization scheme and a proof that carries `ath`,
+  on LumoAuth's own API as well as through `AuthorizeRequest`. An unbound token keeps the
+  `Bearer` scheme.
+
+`NewDPoPSignerEd25519` signs `EdDSA` proofs instead. `GenerateDPoPKeyPEM` and
+`LoadDPoPSigner` keep one key across restarts; `NewDPoPSignerFromKey` wraps an existing
+`*ecdsa.PrivateKey` (P-256) or `ed25519.PrivateKey`. `signer.Proof(method, url, opts...)`
+signs a proof by hand, and `signer.Thumbprint()` is the value that appears in a bound token's
+`cnf.jkt`. If a resource server answers 401 with a `DPoP-Nonce` header, call
+`signer.RememberNonce(resp)` and send the request again. `WithDPoP(signer)` does the same
+for a plain `Client`. `APIConfig` refuses a bound token: the generated client cannot sign
+proofs.
+
+### Verify LumoAuth tokens in your MCP server
+
+An MCP server, or any API, that receives LumoAuth access tokens verifies them locally. Three
+lines protect a `net/http` handler:
+
+```go
+protect := lumoauth.RequireAccessToken(lumoauth.AccessTokenVerifyOptions{
+    Issuer:   "https://app.lumoauth.dev/orgs/acme-corp/api/v1",
+    Resource: "https://mcp.example.com/mcp", // the Resource URI the server is registered with
+})
+mux.Handle("/mcp", protect(mcpHandler))
+```
+
+Inside the handler, `claims, _ := lumoauth.AccessTokenFromContext(r.Context())` gives the
+verified claims: `Subject` (`agent_agt_…` for an agent, a user id otherwise), `IsAgent`,
+`Scopes()` and `HasScope`, `Capabilities`, the delegation chain in `Act` (`ActorChain()`
+lists it), and `Confirmation.JKT` for a bound token. A missing or invalid token gets a 401
+with a `WWW-Authenticate` challenge and a JSON body.
+
+To verify a token yourself, call `VerifyAccessToken`:
+
+```go
+claims, err := lumoauth.VerifyAccessToken(ctx, token, lumoauth.AccessTokenVerifyOptions{
+    Issuer:   issuer,
+    Resource: resource,
+    DPoP:     lumoauth.DPoPRequestFromHTTP(r), // needed for DPoP-bound tokens
+})
+```
+
+It checks the `at+jwt` type, the algorithm (RSA and EC only; `none` and HMAC are refused),
+the issuer, the signature against the organization's keys, `exp` and `nbf` with 60 seconds
+of tolerance (`ClockSkew`; a negative value means none), that `aud` contains `Resource`,
+and that the token is not a test token (`token_use: "test"`). For a token with `cnf.jkt` it
+also checks the DPoP proof: the `DPoP` scheme, the proof signature, `htm` and `htu`, the
+`iat` window, `ath`, the key thumbprint, and that the proof's `jti` was not seen before.
+`RequireDPoP: true` refuses tokens that are not bound. A rejection is a `ValidationError`
+whose `Reason` is one of the `TokenRejected*` constants; `RejectionReason(err)` reads it.
+
+The keys come from `{issuer}/.well-known/openid-configuration` and are cached per issuer,
+with one refetch when a token names an unknown `kid`. Pass `JWKS` to supply them yourself,
+or `KeyCache` (`NewAccessTokenKeyCache`) to control the cache. Replayed proofs are caught by
+an in-memory `ReplayCache`; a server with several replicas should pass a shared
+implementation. Local verification does not check revocation.
+
+`VerifyAuthToken` is the separate verifier for AAuth `auth+jwt` tokens.
 
 ### Check access to an MCP tool
 
@@ -1159,6 +1248,15 @@ All of them need an agent credential. Portal test tokens are refused.
 | `TokenDetailed(...)` | The same, with the full response |
 | `AuthorizeTool(ctx, McpToolAuthorizeParams)` | May a user or agent run this tool? Called by the MCP server with its own token (`mcp:authorize`); a deny returns `Allowed` false |
 
+### `DPoPSigner`
+
+| Method | What it does |
+| --- | --- |
+| `Proof(method, url, opts...)` | Signs a DPoP proof; `WithProofAccessToken` adds `ath`, `WithProofNonce` overrides the nonce |
+| `AuthorizeRequest(req, token)` | Sets `Authorization` (`DPoP` scheme for a bound token, `Bearer` otherwise) and the `DPoP` header |
+| `PublicJWK()`, `Thumbprint()`, `Algorithm()` | The public key, its RFC 7638 thumbprint, `ES256` or `EdDSA` |
+| `SetNonce(url, nonce)`, `Nonce(url)`, `RememberNonce(resp)` | Nonce memory per origin |
+
 ### Package functions
 
 | Function | What it does |
@@ -1167,6 +1265,8 @@ All of them need an agent credential. Portal test tokens are refused.
 | `NewJITContext(source, opts...)` | A JIT context over an `Agent` or any `TokenSource` |
 | `NewDelegationChain(agent, redirectURI)` | A delegation manager |
 | `VerifyAuthToken`, `NewJWKSCache`, `FetchIssuerJWKS` | Verify AAuth tokens |
+| `VerifyAccessToken`, `RequireAccessToken`, `AccessTokenFromContext`, `DPoPRequestFromHTTP`, `NewAccessTokenKeyCache`, `FetchAccessTokenJWKS`, `NewMemoryReplayCache`, `RejectionReason` | Verify LumoAuth access tokens in an MCP server |
+| `NewDPoPSigner`, `NewDPoPSignerEd25519`, `NewDPoPSignerFromKey`, `LoadDPoPSigner`, `GenerateDPoPKeyPEM`, `DPoPBound`, `DPoPAccessTokenHash` | DPoP keys and helpers |
 | `GenerateKeypair`, `LoadPrivateKey`, `PublicJWK`, `SignRequest` | AAuth key and signing helpers |
 | `UserFromContext`, `TokensFromContext` | Read the session in a handler |
 | `AsAPIError`, `StatusCode`, `ErrorCode` | Error helpers |
