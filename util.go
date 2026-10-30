@@ -9,7 +9,7 @@ import (
 )
 
 // Version is the SDK version reported in the User-Agent header.
-const Version = "1.0.0"
+const Version = "1.2.0"
 
 // userAgent builds the default User-Agent, including the Go runtime and,
 // when the SDK is consumed as a module, its resolved version.
