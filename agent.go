@@ -44,6 +44,14 @@ type AgentConfig struct {
 	HTTPClient *http.Client
 	// SkipCertValidation disables TLS verification. Local development only.
 	SkipCertValidation bool
+	// PrivateKey is for an agent registered with the "Private key JWT"
+	// identity type: the agent then signs a client assertion (RFC 7523) for
+	// every token request and needs no ClientSecret. Defaults to the PEM key
+	// in $AGENT_PRIVATE_KEY, with its kid from $AGENT_KEY_ID.
+	PrivateKey *ClientAssertionSigner
+	// Issuer is the organization's issuer identifier, the assertion's aud.
+	// Defaults to IssuerFor(BaseURL, OrgID); set it on a custom domain.
+	Issuer string
 	// DPoP binds the agent's tokens to a key (RFC 9449). The client
 	// credentials grant, MCP token exchanges and delegation exchanges then
 	// send a DPoP proof, the tokens come back with token_type "DPoP", and
@@ -97,6 +105,8 @@ type Agent struct {
 	clientSecret string
 	redirectURI  string
 	scopes       []string
+	assertion    *ClientAssertionSigner
+	issuer       string
 
 	client *Client
 
@@ -120,16 +130,35 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 		baseURL:      firstNonEmpty(cfg.BaseURL, os.Getenv(EnvBaseURL), DefaultBaseURL),
 		orgID:        firstNonEmpty(cfg.OrgID, os.Getenv(EnvOrgID)),
 		clientID:     firstNonEmpty(cfg.ClientID, os.Getenv(EnvAgentClientID)),
-		clientSecret: firstNonEmpty(cfg.ClientSecret, os.Getenv(EnvAgentClientSecret)),
+		clientSecret: cfg.ClientSecret,
 		redirectURI:  cfg.RedirectURI,
 		scopes:       cfg.Scopes,
+		assertion:    cfg.PrivateKey,
+		issuer:       cfg.Issuer,
 	}
 	agent.baseURL = strings.TrimRight(agent.baseURL, "/")
 
-	if agent.clientID == "" || agent.clientSecret == "" {
+	if agent.assertion == nil && os.Getenv(EnvAgentPrivateKey) != "" {
+		signer, err := LoadClientAssertionSigner(os.Getenv(EnvAgentPrivateKey), ClientAssertionOptions{KeyID: os.Getenv(EnvAgentKeyID)})
+		if err != nil {
+			return nil, err
+		}
+		agent.assertion = signer
+	}
+	// A private key JWT agent has no secret; an AGENT_CLIENT_SECRET left in
+	// the environment must not become a second authentication method.
+	if agent.clientSecret == "" && agent.assertion == nil {
+		agent.clientSecret = os.Getenv(EnvAgentClientSecret)
+	}
+
+	if agent.clientID == "" || (agent.clientSecret == "" && agent.assertion == nil) {
 		return nil, NewConfigError(
-			"agent credentials are required: set AGENT_CLIENT_ID and AGENT_CLIENT_SECRET, " +
-				"or pass ClientID and ClientSecret in AgentConfig")
+			"agent credentials are required: set AGENT_CLIENT_ID and AGENT_CLIENT_SECRET " +
+				"(or AGENT_PRIVATE_KEY for a private key JWT agent), or pass ClientID with " +
+				"ClientSecret or PrivateKey in AgentConfig")
+	}
+	if agent.clientSecret != "" && agent.assertion != nil {
+		return nil, NewConfigError("pass ClientSecret or PrivateKey, not both: an agent authenticates with one method")
 	}
 
 	agent.client = newClient(&clientConfig{
@@ -189,7 +218,17 @@ func (a *Agent) Authenticate(ctx context.Context, scopes ...string) (string, err
 		requested = a.scopes
 	}
 
-	token, err := a.client.Auth.ClientCredentials(ctx, a.clientID, a.clientSecret, requested...)
+	var token *TokenResponse
+	var err error
+	if a.assertion != nil {
+		assertion, aerr := a.ClientAssertion()
+		if aerr != nil {
+			return "", aerr
+		}
+		token, err = a.client.Auth.ClientCredentialsWithAssertion(ctx, a.clientID, assertion, requested...)
+	} else {
+		token, err = a.client.Auth.ClientCredentials(ctx, a.clientID, a.clientSecret, requested...)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -206,6 +245,23 @@ func (a *Agent) Authenticate(ctx context.Context, scopes ...string) (string, err
 	a.refreshAt = time.Now().Add(expiresIn - tokenRefreshBuffer)
 	a.tokenScopes = token.Scopes()
 	return a.accessToken, nil
+}
+
+// ClientAssertion signs a new private_key_jwt client assertion for this agent
+// (single-use), addressed to AgentConfig.Issuer or IssuerFor(BaseURL, OrgID).
+// It is a *ConfigError when the agent has no PrivateKey.
+func (a *Agent) ClientAssertion() (string, error) {
+	if a.assertion == nil {
+		return "", NewConfigError("this agent signs no client assertions: set AgentConfig.PrivateKey")
+	}
+	audience := a.issuer
+	if audience == "" {
+		if a.orgID == "" {
+			return "", NewConfigError("OrgID (LUMOAUTH_ORG_ID) or Issuer is needed to address a client assertion")
+		}
+		audience = IssuerFor(a.baseURL, a.orgID)
+	}
+	return a.assertion.Assertion(a.clientID, audience)
 }
 
 // AccessToken returns a valid access token, authenticating or refreshing

@@ -189,6 +189,26 @@ func (r *AuthResource) ClientCredentials(ctx context.Context, clientID, clientSe
 	return r.tokenRequest(ctx, form)
 }
 
+// ClientCredentialsWithAssertion performs the client-credentials grant with a
+// private_key_jwt client assertion (RFC 7523) instead of a secret: the
+// authentication of an agent registered with the "Private key JWT" identity
+// type. Build clientAssertion with ClientAssertionSigner.Assertion; it is
+// single-use.
+func (r *AuthResource) ClientCredentialsWithAssertion(ctx context.Context, clientID, clientAssertion string, scopes ...string) (*TokenResponse, error) {
+	if clientID == "" || clientAssertion == "" {
+		return nil, NewValidationError("clientID and clientAssertion are both required for the client-credentials grant")
+	}
+	form := url.Values{}
+	form.Set("grant_type", "client_credentials")
+	form.Set("client_id", clientID)
+	form.Set("client_assertion_type", ClientAssertionType)
+	form.Set("client_assertion", clientAssertion)
+	if len(scopes) > 0 {
+		form.Set("scope", joinScopes(scopes))
+	}
+	return r.tokenRequest(ctx, form)
+}
+
 // TokenExchangeParams describes an RFC 8693 token exchange.
 type TokenExchangeParams struct {
 	// SubjectToken is the token representing the principal being acted

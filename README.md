@@ -208,6 +208,8 @@ A value that you pass in code always wins over the environment variable.
 | --- | --- | --- |
 | `BaseURL`, `OrgID` | As above | the environment variables |
 | `ClientID`, `ClientSecret` | The agent's OAuth client | `$AGENT_CLIENT_ID`, `$AGENT_CLIENT_SECRET` |
+| `PrivateKey` | A `*ClientAssertionSigner` for a **Private key JWT** agent: it signs a client assertion instead of sending a secret | the PEM key in `$AGENT_PRIVATE_KEY`, `kid` from `$AGENT_KEY_ID` |
+| `Issuer` | The organization's issuer identifier, the assertion's `aud` | `IssuerFor(BaseURL, OrgID)` |
 | `Scopes` | Scopes to request when the agent authenticates | the defaults that are registered for the agent |
 | `RedirectURI` | The callback URL of the consent flow for delegation | none |
 | `Timeout`, `HTTPClient`, `SkipCertValidation` | As for `New` | 30 seconds, a new client, off |
@@ -773,6 +775,29 @@ that are bound to a key. Give the agent a DPoP signer and the same call returns 
 With a plain `Client`, call `client.Mcp.Token(ctx, serverID, subjectToken)`. Pass an empty
 `subjectToken` to exchange the client's own bearer token. `TokenDetailed` returns the full
 response, including `TokenType` (`Bearer` or `DPoP`).
+
+### Sign in without a secret: private key JWT
+
+An agent registered with the **Private key JWT** identity type has no client secret. Whenever
+it needs a token, it signs a short-lived JWT (a client assertion, RFC 7523) with its private
+key. Only the public key is registered:
+
+```go
+signer, err := lumoauth.GenerateClientAssertionSigner("ES256", "agent-2026-11")
+pemData, err := signer.PrivateKeyPEM() // keep it in your secret store
+jwks, err := signer.JWKS()             // register this on the agent
+
+signer, err = lumoauth.LoadClientAssertionSigner(os.Getenv("AGENT_PRIVATE_KEY"),
+	lumoauth.ClientAssertionOptions{KeyID: "agent-2026-11"})
+agent, err := lumoauth.NewAgent(lumoauth.AgentConfig{ClientID: "agt_0123456789abcdef", PrivateKey: signer})
+token, err := agent.Authenticate(ctx)
+```
+
+Every token request carries a new assertion: `iss` and `sub` are the agent ID, `aud` is the
+organization's issuer identifier, `exp` is 60 seconds ahead and `jti` is random. The signer
+works with ECDSA (P-256, P-384, P-521), Ed25519 and RSA keys, and RSA keys can use PS256 to
+PS512 through `ClientAssertionOptions.Algorithm`. `Auth.ClientCredentialsWithAssertion` sends
+an assertion on a plain client.
 
 ### Bind tokens to a key with DPoP
 
