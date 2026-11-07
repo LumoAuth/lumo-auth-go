@@ -380,18 +380,17 @@ func (a *Agent) Capabilities(ctx context.Context) ([]string, error) {
 	return info.Capabilities, nil
 }
 
-// HasCapability reports whether the agent holds a capability.
+// HasCapability reports whether the agent holds a capability. Names match as
+// on the server: "tool:search_web" matches the stored "tool.search_web", and
+// a held "tool.*" covers it (see CapabilityCovers). It checks only the agent's
+// registered capabilities; the Ask API (Agent.Ask) also applies your policies
+// and the token's scope.
 func (a *Agent) HasCapability(ctx context.Context, capability string) (bool, error) {
 	capabilities, err := a.Capabilities(ctx)
 	if err != nil {
 		return false, err
 	}
-	for _, held := range capabilities {
-		if held == capability {
-			return true, nil
-		}
-	}
-	return false, nil
+	return AnyCapabilityCovers(capabilities, capability), nil
 }
 
 // RequireCapability is the guard for a capability-gated method: it returns

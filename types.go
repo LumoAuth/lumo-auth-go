@@ -283,6 +283,11 @@ type AgentBudget struct {
 	MaxTokensPerDay int `json:"max_tokens_per_day,omitempty"`
 	TokensUsedToday int `json:"tokens_used_today,omitempty"`
 
+	// ReportedExhausted is the server's own verdict (`exhausted`): true when
+	// any limit (calls, tokens or cost, per hour, day or month) is reached.
+	// Nil when the server did not report it.
+	ReportedExhausted *bool `json:"exhausted,omitempty"`
+
 	// Raw is the complete decoded policy.
 	Raw map[string]any `json:"-"`
 }
@@ -298,10 +303,18 @@ func (b *AgentBudget) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &b.Raw)
 }
 
-// Exhausted reports whether the daily token budget has been reached. A
-// policy without a daily cap is never exhausted.
+// Exhausted reports whether the agent's budget is spent, so the next metered
+// call would get 429. It uses the server's verdict when reported (any limit,
+// any window); otherwise it compares the daily token cap with today's usage,
+// and a policy without a daily cap is never exhausted.
 func (b *AgentBudget) Exhausted() bool {
-	if b == nil || b.MaxTokensPerDay <= 0 {
+	if b == nil {
+		return false
+	}
+	if b.ReportedExhausted != nil {
+		return *b.ReportedExhausted
+	}
+	if b.MaxTokensPerDay <= 0 {
 		return false
 	}
 	return b.TokensUsedToday >= b.MaxTokensPerDay

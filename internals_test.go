@@ -365,13 +365,26 @@ func TestAgentBudgetExhausted(t *testing.T) {
 		{"under cap", &AgentBudget{MaxTokensPerDay: 100, TokensUsedToday: 99}, false},
 		{"at cap", &AgentBudget{MaxTokensPerDay: 100, TokensUsedToday: 100}, true},
 		{"over cap", &AgentBudget{MaxTokensPerDay: 100, TokensUsedToday: 150}, true},
+		// The server's verdict covers every limit and window, so it wins.
+		{"server says exhausted under the daily cap", &AgentBudget{MaxTokensPerDay: 100, TokensUsedToday: 1, ReportedExhausted: boolPtr(true)}, true},
+		{"server says not exhausted over the daily cap", &AgentBudget{MaxTokensPerDay: 100, TokensUsedToday: 150, ReportedExhausted: boolPtr(false)}, false},
 	}
 	for _, tc := range cases {
 		if got := tc.budget.Exhausted(); got != tc.want {
 			t.Errorf("%s: Exhausted() = %v, want %v", tc.name, got, tc.want)
 		}
 	}
+
+	var decoded AgentBudget
+	if err := json.Unmarshal([]byte(`{"max_api_calls_per_hour":10,"api_calls_this_hour":10,"exhausted":true}`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Exhausted() || decoded.Raw["api_calls_this_hour"] != float64(10) {
+		t.Errorf("decoded budget = %+v", decoded)
+	}
 }
+
+func boolPtr(b bool) *bool { return &b }
 
 func TestApprovalImpactValid(t *testing.T) {
 	for _, impact := range []ApprovalImpact{ImpactLow, ImpactMedium, ImpactHigh, ImpactCritical} {

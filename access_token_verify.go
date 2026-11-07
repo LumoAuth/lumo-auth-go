@@ -113,14 +113,12 @@ func (c *AccessTokenClaims) HasScope(scope string) bool {
 	return false
 }
 
-// HasCapability reports whether an agent token carries a capability.
+// HasCapability reports whether the agent's capabilities claim covers a
+// capability. Names match as on the server ("tool:search_web" matches
+// "tool.search_web"; "invoices.*" covers "invoices.read"). Scopes are
+// different: HasScope compares them exactly.
 func (c *AccessTokenClaims) HasCapability(capability string) bool {
-	for _, held := range c.Capabilities {
-		if held == capability {
-			return true
-		}
-	}
-	return false
+	return AnyCapabilityCovers(c.Capabilities, capability)
 }
 
 // IsDPoPBound reports whether the token is sender-constrained (cnf.jkt).

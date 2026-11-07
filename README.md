@@ -534,6 +534,8 @@ Check capabilities and the budget:
 
 ```go
 // Returns an error that matches ErrPermissionDenied when the capability is missing.
+// Names match as on the server: "tool:search_web" matches the stored
+// "tool.search_web", and a held "tool.*" covers it.
 if err := agent.RequireCapability(ctx, "tool:search_web"); err != nil {
     return err
 }
