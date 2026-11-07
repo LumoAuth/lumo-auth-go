@@ -371,6 +371,36 @@ func (a *Agent) Info(ctx context.Context, refresh bool) (*UserInfo, error) {
 	return info, nil
 }
 
+// ReportUsage reports the model tokens and cost that the agent just used, for
+// example the usage that the model provider returned. LumoAuth does not see
+// model calls, so token and cost limits count only reported usage. The budget
+// in the result also replaces the cached one, so CheckBudget reflects the
+// report without another request.
+//
+//	resp, _ := llm.Chat(ctx, req)
+//	if _, err := agent.ReportUsage(ctx, resp.Usage.TotalTokens, 0.0042); err != nil {
+//	    return err
+//	}
+//	if err := agent.CheckBudget(ctx); err != nil {
+//	    return err // ErrBudgetExceeded
+//	}
+func (a *Agent) ReportUsage(ctx context.Context, tokens int, costUSD float64) (*UsageReportResult, error) {
+	result, err := a.Agents.ReportUsage(ctx, tokens, costUSD)
+	if err != nil {
+		return nil, err
+	}
+	if result.Budget != nil {
+		a.mu.Lock()
+		if a.info != nil {
+			updated := *a.info
+			updated.BudgetPolicy = result.Budget
+			a.info = &updated
+		}
+		a.mu.Unlock()
+	}
+	return result, nil
+}
+
 // Capabilities returns the agent's capability slugs.
 func (a *Agent) Capabilities(ctx context.Context) ([]string, error) {
 	info, err := a.Info(ctx, false)

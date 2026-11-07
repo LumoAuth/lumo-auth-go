@@ -227,6 +227,20 @@ func (u *UserInfo) UnmarshalJSON(data []byte) error {
 // ── Agents ────────────────────────────────────────────────────────────
 
 // AgentAskResult is the decision returned by the Ask API.
+// RecordedUsage is the usage that LumoAuth added to the agent's budget windows.
+type RecordedUsage struct {
+	Tokens  int     `json:"tokens"`
+	CostUSD float64 `json:"cost_usd"`
+}
+
+// UsageReportResult is the answer to AgentsResource.ReportUsage: what was
+// recorded, and the agent's budget after it (the same shape as BudgetPolicy in
+// UserInfo; Budget.Exhausted() means that the next metered call gets 429).
+type UsageReportResult struct {
+	Recorded RecordedUsage `json:"recorded"`
+	Budget   *AgentBudget  `json:"budget,omitempty"`
+}
+
 type AgentAskResult struct {
 	Allowed bool           `json:"allowed"`
 	Action  string         `json:"action,omitempty"`

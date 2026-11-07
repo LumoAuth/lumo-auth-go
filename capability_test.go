@@ -2,6 +2,7 @@ package lumoauth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -134,5 +135,56 @@ func TestAccessTokenClaimsHasCapabilityMatchesLikeTheServer(t *testing.T) {
 	}
 	if !claims.HasScope("invoices.read") || claims.HasScope("invoices:read") {
 		t.Error("scopes stay exact, as in OAuth")
+	}
+}
+
+func TestAgentReportUsageRefreshesTheCachedBudget(t *testing.T) {
+	var reported map[string]any
+	agent, _ := newTestAgent(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/oauth/token"):
+			writeJSON(w, 200, map[string]any{"access_token": "t", "expires_in": 3600})
+		case strings.HasSuffix(r.URL.Path, "/oauth/userinfo"):
+			writeJSON(w, 200, map[string]any{"sub": "agent_1", "budget_policy": map[string]any{
+				"max_tokens_per_day": 1000, "tokens_used_today": 0, "exhausted": false}})
+		case strings.HasSuffix(r.URL.Path, "/agents/me/usage"):
+			if r.Method != http.MethodPost {
+				t.Errorf("method = %s", r.Method)
+			}
+			_ = json.NewDecoder(r.Body).Decode(&reported)
+			writeJSON(w, 200, map[string]any{
+				"recorded": map[string]any{"tokens": 1000, "cost_usd": 0.02},
+				"budget":   map[string]any{"max_tokens_per_day": 1000, "tokens_used_today": 1000, "exhausted": true},
+			})
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	})
+	ctx := context.Background()
+	if err := agent.CheckBudget(ctx); err != nil {
+		t.Fatalf("CheckBudget before the report: %v", err)
+	}
+
+	result, err := agent.ReportUsage(ctx, 1000, 0.02)
+	if err != nil {
+		t.Fatalf("ReportUsage: %v", err)
+	}
+	if reported["tokens"] != float64(1000) || reported["cost_usd"] != 0.02 {
+		t.Errorf("request body = %v", reported)
+	}
+	if result.Recorded.Tokens != 1000 || result.Recorded.CostUSD != 0.02 || !result.Budget.Exhausted() {
+		t.Errorf("result = %+v", result)
+	}
+	if err := agent.CheckBudget(ctx); !errors.Is(err, ErrBudgetExceeded) {
+		t.Errorf("the cached budget should now be exhausted, got %v", err)
+	}
+
+	for _, c := range []struct {
+		tokens int
+		cost   float64
+	}{{-1, 0}, {0, 0}, {0, -0.5}} {
+		if _, err := agent.ReportUsage(ctx, c.tokens, c.cost); !errors.Is(err, ErrValidation) {
+			t.Errorf("ReportUsage(%d, %v) should be a validation error, got %v", c.tokens, c.cost, err)
+		}
 	}
 }

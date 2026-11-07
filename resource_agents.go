@@ -1,6 +1,9 @@
 package lumoauth
 
-import "context"
+import (
+	"context"
+	"math"
+)
 
 // AgentsResource covers agent identity: the Ask API for preflight
 // authorization, self-inspection, and registration.
@@ -34,6 +37,31 @@ func (r *AgentsResource) Ask(ctx context.Context, action string, actionContext m
 
 	var result AgentAskResult
 	if err := r.http.call(ctx, RouteAgentsAsk, nil, &request{JSON: body}, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ReportUsage reports the model tokens and cost that the agent used.
+//
+// LumoAuth does not see the agent's model calls, so token and cost limits
+// (max_tokens_per_day, max_cost_per_month_usd, …) count only the usage that is
+// reported here. Report after each model call, or batch a few. The report is
+// not a metered call and is accepted when the budget is spent; the result's
+// Budget says whether it is. Agent credentials only.
+func (r *AgentsResource) ReportUsage(ctx context.Context, tokens int, costUSD float64) (*UsageReportResult, error) {
+	if tokens < 0 {
+		return nil, NewValidationError("tokens must not be negative")
+	}
+	if costUSD < 0 || math.IsNaN(costUSD) || math.IsInf(costUSD, 0) {
+		return nil, NewValidationError("cost_usd must be a non-negative number")
+	}
+	if tokens == 0 && costUSD == 0 {
+		return nil, NewValidationError("report tokens or cost_usd greater than zero")
+	}
+	var result UsageReportResult
+	body := map[string]any{"tokens": tokens, "cost_usd": costUSD}
+	if err := r.http.call(ctx, RouteAgentsReportUsage, nil, &request{JSON: body}, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

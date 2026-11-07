@@ -64,6 +64,7 @@ const (
 	RouteAgentsAuthorizeMcpTool = "agents.authorizeMcpTool"
 	RouteAgentsMe               = "agents.me"
 	RouteAgentsRegister         = "agents.register"
+	RouteAgentsReportUsage      = "agents.reportUsage"
 
 	// ── MCP (per-tool checks asked by an MCP server) ──────────────────
 	RouteMcpAuthorizeTool = "mcp.authorizeTool"
@@ -139,6 +140,7 @@ var Routes = map[string]Route{
 	RouteAgentsAuthorizeMcpTool: {"POST", orgBase + "/agents/me/mcp/authorize"},
 	RouteAgentsMe:               {"GET", orgBase + "/agents/me"},
 	RouteAgentsRegister:         {"POST", orgBase + "/agents/register"},
+	RouteAgentsReportUsage:      {"POST", orgBase + "/agents/me/usage"},
 
 	// ── MCP ───────────────────────────────────────────────────────────
 	RouteMcpAuthorizeTool: {"POST", orgBase + "/mcp/servers/{serverId}/tools/authorize"},

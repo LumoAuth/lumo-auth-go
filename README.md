@@ -545,8 +545,12 @@ if err := agent.CheckBudget(ctx); err != nil {
     return err
 }
 
+// LumoAuth does not see your model calls: report their tokens and cost so that
+// token and cost limits apply. The result's Budget also refreshes CheckBudget.
+_, err = agent.ReportUsage(ctx, resp.Usage.TotalTokens, 0.0042)
+
 caps, err := agent.Capabilities(ctx)      // []string
-budget, err := agent.Budget(ctx)          // MaxTokensPerDay, TokensUsedToday
+budget, err := agent.Budget(ctx)          // MaxTokensPerDay, TokensUsedToday, ReportedExhausted
 me, err := agent.Identity(ctx, false)     // identity, capabilities, workspace (cached)
 ```
 
