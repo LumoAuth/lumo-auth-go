@@ -27,7 +27,6 @@ import (
 // coverage catches up.
 var knownDrift = map[string]string{
 	RouteWebCheckEmail: "served by the web firewall, not the JSON API",
-	RouteWebMagicLink:  "served by the web firewall, not the JSON API",
 	RouteWellKnownAAuthIssuer: "served at the instance root; the spec only documents " +
 		"the org-scoped /orgs/{orgId}/api/v1/.well-known/aauth-issuer",
 }

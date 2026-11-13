@@ -133,7 +133,7 @@ var Routes = map[string]Route{
 	// knownDrift: served by the web firewall, not the JSON API, so they are
 	// absent from openapi.json.
 	RouteWebCheckEmail: {"POST", "/orgs/{orgId}/check-email"},
-	RouteWebMagicLink:  {"POST", "/orgs/{orgId}/magic-link"},
+	RouteWebMagicLink:  {"POST", "/orgs/{orgId}/api/v1/oauth/magic-link"},
 
 	// ── Agents (identity) ─────────────────────────────────────────────
 	RouteAgentsAsk:              {"POST", orgBase + "/agents/ask"},
