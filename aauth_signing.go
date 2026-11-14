@@ -23,13 +23,24 @@ import (
 //
 //   - Covered components: @method @authority @path signature-key
 //     content-digest content-type authorization — plus @query if and only
-//     if the target URI has a query string.
-//   - Signature-Input parameters: exactly `created` (within ±60s of the
-//     server clock) and a fresh `nonce` (≥12 bytes of entropy, base64url).
-//   - Content-Digest per RFC 9530 using STANDARD base64 (sha-256=:…:).
-//   - The Signature value is base64url-encoded (label=:…:).
-//   - Algorithms are dispatched by key type — Ed25519 or RSA-PSS-SHA512
-//     (MGF1-SHA512, 64-byte salt). No `alg` parameter is declared.
+//     if the target URI has a query string. signature-key and authorization
+//     are the values of the Signature-Key and Authorization request headers,
+//     or the empty string when the header is not sent. @target-uri is not
+//     accepted in place of @authority and @path.
+//   - Signature-Input parameters: `created` (required, within ±60s of the
+//     server clock) and a single-use `nonce` (required, base64url of at
+//     least 12 random bytes). The server also accepts `expires`, `alg`,
+//     `keyid` and `tag`, and refuses any other parameter. This signer sends
+//     only `created` and `nonce`.
+//   - Content-Digest per RFC 9530 using STANDARD base64 (sha-256=:…:). The
+//     header is mandatory and must match the body.
+//   - The Signature value (label=:…:) is sent base64url-encoded. The server
+//     accepts base64url and standard base64.
+//   - The algorithm follows the key type: Ed25519 → ed25519, RSA →
+//     rsa-pss-sha512 (MGF1-SHA512, 64-byte salt). The server also accepts
+//     EC P-256 keys (ecdsa-p256-sha256, raw r||s), which this signer does
+//     not support. An `alg` parameter is optional (it must then name the
+//     algorithm of the key); this signer declares none.
 //
 // The output is byte-compatible with the JS and Python SDKs.
 
@@ -62,7 +73,11 @@ type SignOptions struct {
 	// Authorization is the value of a covered Authorization header, when
 	// the request carries one (proof-of-possession requests do).
 	Authorization string
-	// SignatureKey is the value of a covered Signature-Key header.
+	// SignatureKey is the value of a covered Signature-Key header. It is
+	// also sent as that header. Its label must be "sig1", the label of
+	// Signature-Input and Signature. POST /aauth/agent/issue requires
+	// `sig1=jwks_uri;id="<agent identifier>";kid="<kid>"`; the agent token
+	// endpoint and /aauth/token/revoke need no Signature-Key.
 	SignatureKey string
 	// Created overrides the signature timestamp. Testing only — the server
 	// rejects timestamps more than 60s from its own clock.
@@ -139,7 +154,9 @@ func SignSignatureBase(signatureBase string, key crypto.Signer) (string, error) 
 
 // VerifySignatureBase checks a base64url signature over a signature base.
 // Resource servers use it to verify proof-of-possession against the key in
-// a token's cnf.jwk.
+// a token's cnf.jwk. It handles Ed25519 and RSA keys only: a signature made
+// with an EC P-256 key, which the server also accepts from agents, does not
+// verify here.
 func VerifySignatureBase(signatureBase, signatureB64URL string, key crypto.PublicKey) bool {
 	signature, err := b64urlDecode(signatureB64URL)
 	if err != nil {

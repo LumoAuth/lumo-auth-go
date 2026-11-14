@@ -49,8 +49,7 @@ type AAuthConfig struct {
 //	}
 //
 //	result, err := client.RequestAuthToken(ctx, lumoauth.AuthTokenParams{
-//	    ResourceToken: resourceToken,
-//	    Scope:         "read write",
+//	    ResourceToken: resourceToken, // its scope claim names the scope
 //	    AgentToken:    agentToken,
 //	})
 //	if err != nil {
@@ -140,7 +139,8 @@ func (c *AAuthClient) PublicJWK() (JWK, error) {
 }
 
 // PublicJWKThumbprint returns the RFC 7638 thumbprint of the agent's public
-// key — the `jkt` value that binds tokens to this key.
+// key. A resource names this value as `agent_jkt` when it asks for a
+// resource token for the agent.
 func (c *AAuthClient) PublicJWKThumbprint() (string, error) {
 	jwk, err := c.PublicJWK()
 	if err != nil {
@@ -197,22 +197,26 @@ type AuthTokenParams struct {
 	// ResourceToken is the `resource+jwt` obtained from the target
 	// resource. Required.
 	ResourceToken string
-	// Scope is space-separated and informational; scopes bind through the
-	// resource token.
+	// Scope is space-separated. It is sent as the body field `scope`, which
+	// the server ignores for request_type=auth: the scope of the auth token
+	// comes from the resource token's `scope` claim.
 	Scope string
 	// AgentToken is the `agent+jwt` presented in Agent-Auth. Required —
 	// the endpoint authenticates the agent through that header, not the
-	// request body.
+	// request body. The request must be signed with the key in the agent
+	// token's cnf claim.
 	AgentToken string
-	// RedirectURI is where consent should return the user, for flows that
-	// need it. Must be registered for the agent.
+	// RedirectURI is where consent should return the user. Required when
+	// the user has to consent (the server answers 400 invalid_request
+	// without it). Must be registered for the agent.
 	RedirectURI string
 }
 
 // RequestAuthToken asks for an auth token (AAuth Flow 2, direct
 // authorization).
 //
-// When the server requires user consent it returns a response with
+// When the server requires user consent it answers 200 with a
+// request_token and an authorization_uri, returned here as a response with
 // AuthorizationRequired set: redirect the user to AuthorizationURI, then
 // call ExchangeCode with the code delivered to your redirect URI.
 func (c *AAuthClient) RequestAuthToken(ctx context.Context, params AuthTokenParams) (*AAuthTokenResponse, error) {
@@ -236,8 +240,9 @@ func (c *AAuthClient) RequestAuthToken(ctx context.Context, params AuthTokenPara
 
 	raw, err := c.tokenRequest(ctx, body, params.AgentToken)
 	if err != nil {
-		// A 401 carrying a consent URL is not a failure: it is the
-		// server asking for the user's approval.
+		// LumoAuth asks for consent with a 200 (handled below); its 401
+		// means that the agent token or the signature was refused. A 401
+		// that does carry a consent URL is still read as a consent request.
 		if consent, ok := consentFromError(err); ok {
 			return consent, nil
 		}
@@ -294,8 +299,9 @@ func (c *AAuthClient) ExchangeCode(ctx context.Context, code, redirectURI, agent
 
 // ExchangeToken performs a multi-hop exchange (request_type=exchange):
 // trade an upstream auth token plus a downstream resource token for a new
-// auth token carrying an `act` actor chain. The agent must be permitted to
-// exchange tokens.
+// auth token carrying an `act` actor chain (act.agent names the upstream
+// agent, act.sub the upstream user; at most 5 hops). The agent must be
+// permitted to exchange tokens.
 func (c *AAuthClient) ExchangeToken(ctx context.Context, authToken, resourceToken, agentToken string) (*AAuthTokenResponse, error) {
 	if authToken == "" || resourceToken == "" {
 		return nil, NewValidationError("both an auth token and a resource token are required")
@@ -319,18 +325,22 @@ func (c *AAuthClient) ExchangeToken(ctx context.Context, authToken, resourceToke
 type RefreshParams struct {
 	// RefreshToken is the token from a prior response. Required.
 	RefreshToken string
-	// ResourceToken must be a FRESH resource token for the target
-	// resource — the server requires one on every refresh. Required.
+	// ResourceToken must be a resource token from the resource that the
+	// refresh token was granted for — the server requires one on every
+	// refresh. Its `scope` claim may narrow the granted scopes. Required.
 	ResourceToken string
-	// Scope optionally narrows the refreshed token; it must be a subset
-	// of the original grant.
+	// Scope is an optional space-delimited scope. It narrows only: every
+	// scope must be in the original grant (and in the resource token's
+	// scope, when it has one). A scope outside the grant is refused with
+	// 400 invalid_scope.
 	Scope string
 	// AgentToken is the `agent+jwt` presented in Agent-Auth. Required.
 	AgentToken string
 }
 
 // Refresh renews an auth token (request_type=refresh). Refresh tokens are
-// not rotated, so the same one stays valid for the grant's lifetime.
+// not rotated, so the same one stays valid for the grant's lifetime and the
+// response carries no new one. A refresh never widens the scope.
 func (c *AAuthClient) Refresh(ctx context.Context, params RefreshParams) (*AAuthTokenResponse, error) {
 	if params.RefreshToken == "" {
 		return nil, NewValidationError("RefreshToken is required")
@@ -480,7 +490,7 @@ func (c *AAuthClient) DiscoverAgents(ctx context.Context) ([]AAuthAgentMetadata,
 		return nil, err
 	}
 
-	// The endpoint returns a single object for one agent, an array for many.
+	// LumoAuth always returns an array; a single object is accepted as well.
 	var agents []AAuthAgentMetadata
 	if err := json.Unmarshal(raw, &agents); err == nil {
 		return agents, nil
@@ -611,8 +621,9 @@ func mapAAuthToken(raw *rawAAuthToken) (*AAuthTokenResponse, error) {
 	return response, nil
 }
 
-// consentFromError recognises the 401 the server returns when a human must
-// approve the request, and converts it into a consent instruction.
+// consentFromError recognises a 401 that carries a consent URL and converts
+// it into a consent instruction. LumoAuth itself asks for consent with a
+// 200 response (request_token, authorization_uri), never with a 401.
 func consentFromError(err error) (*AAuthTokenResponse, bool) {
 	apiErr, ok := AsAPIError(err)
 	if !ok || apiErr.StatusCode != http.StatusUnauthorized {

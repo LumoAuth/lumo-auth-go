@@ -27,17 +27,28 @@ type AAuthClaims struct {
 	Expires  int64  `json:"exp"`
 	IssuedAt int64  `json:"iat"`
 	JTI      string `json:"jti"`
-	Subject  string `json:"sub,omitempty"`
-	// Agent identifies the agent the token was issued to.
+	// Subject is the user. It is a pseudonym for this resource, not the
+	// user ID, when the resource's default auth level is `pseudonymous`, or
+	// `authorized` without a consent record.
+	Subject string `json:"sub,omitempty"`
+	// Agent identifies the agent the token was issued to. The claim is
+	// present only when the audience differs from the agent identifier.
 	Agent string `json:"agent,omitempty"`
-	// AgentDelegate is set when the agent acts for another agent.
+	// AgentDelegate is the delegate (the `sub` of the agent token) that
+	// made the request for the agent, if any.
 	AgentDelegate string `json:"agent_delegate,omitempty"`
-	Scope         string `json:"scope,omitempty"`
-	// Confirmation binds the token to the holder's key (RFC 7800).
+	// Scope lists resource scopes only: openid, profile, email, phone and
+	// address are never listed.
+	Scope string `json:"scope,omitempty"`
+	// Confirmation binds the token to the holder's key (RFC 7800). Auth
+	// tokens carry the agent's full public JWK and no cnf.jkt.
 	Confirmation struct {
 		JWK JWK `json:"jwk"`
 	} `json:"cnf"`
-	// Act records the delegation chain, when there is one.
+	// Act is the actor chain of an exchanged token: {agent,
+	// agent_delegate?, sub?, act?}. act.agent names the upstream agent and
+	// act.sub the upstream user; a nested act holds the earlier hops (at
+	// most 5).
 	Act map[string]any `json:"act,omitempty"`
 
 	// Raw is every claim in the token, including ones not modelled above.
@@ -185,6 +196,14 @@ func VerifyAuthToken(ctx context.Context, token string, opts VerifyOptions) (*AA
 //
 // body must be the exact bytes the request carried, since Content-Digest
 // is computed over them.
+//
+// The check is narrower than the one LumoAuth applies to its own endpoints.
+// It does not require a recent `created`, a new nonce, a Content-Digest
+// header or any particular covered component, and it reads only the
+// `created` and `nonce` parameters. LumoAuth requires @method, @authority,
+// @path and signature-key to be covered, `created` within 60 seconds and a
+// single-use nonce. Apply those checks yourself to stop a captured request
+// from being replayed.
 func (c *AAuthClaims) VerifyProofOfPossession(r *http.Request, body []byte) error {
 	if c.Confirmation.JWK.Kty == "" {
 		return NewValidationError("the token has no cnf.jwk claim to verify against")

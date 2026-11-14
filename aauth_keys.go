@@ -103,7 +103,8 @@ func GenerateKeypair(kid string) (*Keypair, error) {
 }
 
 // LoadPrivateKey parses a PEM private key for AAuth signing. Ed25519 and
-// RSA keys are supported, matching the algorithms the server accepts.
+// RSA keys are supported. The server also accepts EC P-256 keys, which this
+// SDK does not sign with.
 func LoadPrivateKey(pemData string) (crypto.Signer, error) {
 	block, _ := pem.Decode([]byte(pemData))
 	if block == nil {
@@ -234,8 +235,9 @@ func (j *JWK) PublicKey() (crypto.PublicKey, error) {
 }
 
 // Thumbprint computes the RFC 7638 JWK thumbprint — the base64url SHA-256
-// of the key's canonical form. AAuth uses it as the `jkt` value binding a
-// token to a key.
+// of the key's canonical form. LumoAuth uses it as `agent_jkt` in resource
+// tokens and as `cnf_jkt` in the answer of the token verify endpoint. Auth
+// tokens carry the full key in cnf.jwk, not the thumbprint.
 func (j *JWK) Thumbprint() (string, error) {
 	var canonical []byte
 	var err error

@@ -981,12 +981,12 @@ aauth, err := lumoauth.NewAAuthClient(lumoauth.AAuthConfig{
 | `Timeout`, `HTTPClient`, `SkipCertValidation` | As for `New` | 30 seconds, a new client, off |
 
 **3. Get an auth token for a resource.** The resource gives the agent a resource token. The
-agent trades it for an auth token.
+agent trades it for an auth token. The scope of the auth token comes from the resource token:
+LumoAuth ignores `AuthTokenParams.Scope`. Set `RedirectURI` when a person may have to consent.
 
 ```go
 result, err := aauth.RequestAuthToken(ctx, lumoauth.AuthTokenParams{
     ResourceToken: resourceToken,
-    Scope:         "read write",
     AgentToken:    agentToken,
 })
 if err != nil {
@@ -1018,7 +1018,7 @@ Other `AAuthClient` methods:
 | Method | What it does |
 | --- | --- |
 | `ExchangeToken(ctx, authToken, resourceToken, agentToken)` | Gets a token for a further hop. The new token records the chain in `act`. |
-| `Refresh(ctx, params)` | Renews an auth token with a refresh token |
+| `Refresh(ctx, params)` | Renews an auth token with a refresh token and a resource token from the same resource. `Scope` only narrows: a scope outside the grant is refused with `invalid_scope` |
 | `Revoke(ctx, token, tokenType, agentToken)` | Revokes an auth token (by its `jti`, with `AAuthTokenTypeAuth`) or a refresh token (with `AAuthTokenTypeRefresh`) |
 | `DiscoverIssuer`, `DiscoverAgents`, `DiscoverResource`, `JWKS` | Read the metadata documents |
 | `SignRequest(method, url, opts)` | Builds the signature headers without sending the request |
