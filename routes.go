@@ -129,9 +129,7 @@ var Routes = map[string]Route{
 	// JSON credential login used by identifier-first sign-in.
 	RouteOAuthLoginJSON: {"POST", orgBase + "/oauth/login/json"},
 
-	// ── Web (HTML) routes ─────────────────────────────────────────────
-	// knownDrift: served by the web firewall, not the JSON API, so they are
-	// absent from openapi.json.
+	// ── Sign-in from the application's own form (JSON API) ───────────
 	RouteWebCheckEmail: {"POST", "/orgs/{orgId}/api/v1/oauth/check-email"},
 	RouteWebMagicLink:  {"POST", "/orgs/{orgId}/api/v1/oauth/magic-link"},
 

@@ -26,7 +26,6 @@ import (
 // document. They are exercised against the live server; revisit when spec
 // coverage catches up.
 var knownDrift = map[string]string{
-	RouteWebCheckEmail: "served by the web firewall, not the JSON API",
 	RouteWellKnownAAuthIssuer: "served at the instance root; the spec only documents " +
 		"the org-scoped /orgs/{orgId}/api/v1/.well-known/aauth-issuer",
 }
