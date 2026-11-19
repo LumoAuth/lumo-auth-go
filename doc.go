@@ -64,10 +64,10 @@ rest of the REST API — admin endpoints, SCIM, audit logs — use
 	    return err
 	}
 
-	if err := agent.RequireCapability(ctx, "tool:search_web"); err != nil {
+	if err := agent.RequireCapability(ctx, "web:search"); err != nil {
 	    return err
 	}
-	allowed, err := agent.IsAllowed(ctx, "document.read", map[string]any{"id": "doc_99"})
+	allowed, err := agent.IsAllowed(ctx, "document:read", map[string]any{"id": "doc_99"})
 
 Before an irreversible action, ask a human:
 

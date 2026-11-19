@@ -75,14 +75,14 @@ func TestAgentAuthenticatesLazily(t *testing.T) {
 				t.Errorf("client_id = %q", r.Form.Get("client_id"))
 			}
 			writeJSON(w, 200, map[string]any{
-				"access_token": "agent-token", "expires_in": 3600, "scope": "read:documents",
+				"access_token": "agent-token", "expires_in": 3600, "scope": "documents:read",
 			})
 		case strings.HasSuffix(r.URL.Path, "/agents/ask"):
 			askCalls++
 			if got := r.Header.Get("Authorization"); got != "Bearer agent-token" {
 				t.Errorf("Authorization = %q", got)
 			}
-			writeJSON(w, 200, map[string]any{"allowed": true, "action": "document.read"})
+			writeJSON(w, 200, map[string]any{"allowed": true, "action": "document:read"})
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
@@ -94,7 +94,7 @@ func TestAgentAuthenticatesLazily(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	allowed, err := agent.IsAllowed(ctx, "document.read", nil)
+	allowed, err := agent.IsAllowed(ctx, "document:read", nil)
 	if err != nil {
 		t.Fatalf("IsAllowed: %v", err)
 	}
@@ -106,13 +106,13 @@ func TestAgentAuthenticatesLazily(t *testing.T) {
 	}
 
 	// The cached token is reused.
-	if _, err := agent.IsAllowed(ctx, "document.read", nil); err != nil {
+	if _, err := agent.IsAllowed(ctx, "document:read", nil); err != nil {
 		t.Fatalf("IsAllowed: %v", err)
 	}
 	if tokenCalls != 1 {
 		t.Errorf("a valid token should be reused, but authenticated %d times", tokenCalls)
 	}
-	if scopes := agent.TokenScopes(); len(scopes) != 1 || scopes[0] != "read:documents" {
+	if scopes := agent.TokenScopes(); len(scopes) != 1 || scopes[0] != "documents:read" {
 		t.Errorf("TokenScopes = %v", scopes)
 	}
 }
@@ -132,7 +132,7 @@ func TestAgentRefreshesBeforeExpiry(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < 2; i++ {
-		if _, err := agent.IsAllowed(ctx, "document.read", nil); err != nil {
+		if _, err := agent.IsAllowed(ctx, "document:read", nil); err != nil {
 			t.Fatalf("IsAllowed: %v", err)
 		}
 	}
@@ -164,7 +164,7 @@ func TestAgentConcurrentCallersShareOneTokenRequest(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := agent.IsAllowed(ctx, "document.read", nil); err != nil {
+			if _, err := agent.IsAllowed(ctx, "document:read", nil); err != nil {
 				t.Errorf("IsAllowed: %v", err)
 			}
 		}()
@@ -186,7 +186,7 @@ func TestAgentAuthenticationFailureSurfaces(t *testing.T) {
 		})
 	})
 
-	_, err := agent.IsAllowed(context.Background(), "document.read", nil)
+	_, err := agent.IsAllowed(context.Background(), "document:read", nil)
 	if !errors.Is(err, ErrAuthentication) {
 		t.Errorf("expected an authentication error, got %v", err)
 	}
@@ -205,7 +205,7 @@ func TestAgentCapabilitiesAndBudget(t *testing.T) {
 			infoCalls++
 			writeJSON(w, 200, map[string]any{
 				"sub":          "agent_1",
-				"capabilities": []string{"read:documents", "tool:search_web"},
+				"capabilities": []string{"documents:read", "web:search"},
 				"budget_policy": map[string]any{
 					"max_tokens_per_day": 100000,
 					"tokens_used_today":  100000,
@@ -218,7 +218,7 @@ func TestAgentCapabilitiesAndBudget(t *testing.T) {
 
 	ctx := context.Background()
 
-	has, err := agent.HasCapability(ctx, "tool:search_web")
+	has, err := agent.HasCapability(ctx, "web:search")
 	if err != nil {
 		t.Fatalf("HasCapability: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestAgentCapabilitiesAndBudget(t *testing.T) {
 		t.Error("HasCapability should find a declared capability")
 	}
 
-	has, err = agent.HasCapability(ctx, "tool:send_email")
+	has, err = agent.HasCapability(ctx, "email:send")
 	if err != nil {
 		t.Fatalf("HasCapability: %v", err)
 	}
@@ -238,14 +238,14 @@ func TestAgentCapabilitiesAndBudget(t *testing.T) {
 	}
 
 	// RequireCapability is the guard form.
-	if err := agent.RequireCapability(ctx, "tool:search_web"); err != nil {
+	if err := agent.RequireCapability(ctx, "web:search"); err != nil {
 		t.Errorf("RequireCapability on a held capability: %v", err)
 	}
-	err = agent.RequireCapability(ctx, "tool:send_email")
+	err = agent.RequireCapability(ctx, "email:send")
 	if !errors.Is(err, ErrPermissionDenied) {
 		t.Errorf("expected ErrPermissionDenied, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "tool:send_email") {
+	if !strings.Contains(err.Error(), "email:send") {
 		t.Errorf("the error should name the capability: %v", err)
 	}
 	// No request was made, so there is no HTTP status to report.

@@ -37,7 +37,7 @@ type ConfidentialClient interface {
 //
 //     chain := lumoauth.NewDelegationChain(agent, "https://agent.example.com/callback")
 //
-//     url, err := chain.ConsentURL("session-1", []string{"read:documents"}, "")
+//     url, err := chain.ConsentURL("session-1", []string{"documents:read"}, "")
 //     // … user completes consent, your callback receives `code` …
 //     if err := chain.HandleConsentCallback(ctx, "session-1", code); err != nil {
 //     return err

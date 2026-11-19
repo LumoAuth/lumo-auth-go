@@ -368,7 +368,7 @@ func TestOrgScopedRoutesRequireAnOrgID(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	_, err = client.Agents.Ask(context.Background(), "document.read", nil)
+	_, err = client.Agents.Ask(context.Background(), "document:read", nil)
 	if !errors.Is(err, ErrConfig) {
 		t.Errorf("a missing org ID should be a config error, got %v", err)
 	}

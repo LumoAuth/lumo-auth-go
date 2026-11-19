@@ -49,8 +49,8 @@ func (s *testTokenSigner) mint(t *testing.T, claims map[string]any, header map[s
 	full := map[string]any{
 		"iss": testIssuer, "sub": "agent_agt_1", "aud": testResource,
 		"exp": now.Add(10 * time.Minute).Unix(), "iat": now.Unix(), "nbf": now.Unix(),
-		"jti": "jti-" + b64url([]byte(time.Now().String())), "scope": "mcp:tools read:documents",
-		"is_agent": true, "capabilities": []string{"tool:search_web"}, "client_id": "agent-client",
+		"jti": "jti-" + b64url([]byte(time.Now().String())), "scope": "mcp:tools documents:read",
+		"is_agent": true, "capabilities": []string{"web:search"}, "client_id": "agent-client",
 	}
 	for k, v := range claims {
 		if v == nil {
@@ -105,7 +105,7 @@ func TestVerifyAccessTokenHappyPath(t *testing.T) {
 	if !claims.HasScope("mcp:tools") || claims.HasScope("admin") || len(claims.Scopes()) != 2 {
 		t.Errorf("scopes = %v", claims.Scopes())
 	}
-	if !claims.HasCapability("tool:search_web") {
+	if !claims.HasCapability("web:search") {
 		t.Error("capabilities not decoded")
 	}
 	if chain := claims.ActorChain(); len(chain) != 2 || chain[0] != "agent_agt_1" || chain[1] != "agent_agt_2" {

@@ -70,7 +70,7 @@ type AgentConfig struct {
 //	    return err
 //	}
 //
-//	allowed, err := agent.IsAllowed(ctx, "document.read", map[string]any{"id": "doc_99"})
+//	allowed, err := agent.IsAllowed(ctx, "document:read", map[string]any{"id": "doc_99"})
 //	if err != nil {
 //	    return err
 //	}
@@ -411,8 +411,8 @@ func (a *Agent) Capabilities(ctx context.Context) ([]string, error) {
 }
 
 // HasCapability reports whether the agent holds a capability. Names match as
-// on the server: "tool:search_web" matches the stored "tool.search_web", and
-// a held "tool.*" covers it (see CapabilityCovers). It checks only the agent's
+// on the server: "Web:Search" matches the held "web:search", and a
+// held "web:*" covers it (see CapabilityCovers). It checks only the agent's
 // registered capabilities; the Ask API (Agent.Ask) also applies your policies
 // and the token's scope.
 func (a *Agent) HasCapability(ctx context.Context, capability string) (bool, error) {
@@ -428,7 +428,7 @@ func (a *Agent) HasCapability(ctx context.Context, capability string) (bool, err
 // ErrPermissionDenied when it does not.
 //
 //	func (s *Service) SearchWeb(ctx context.Context, query string) error {
-//	    if err := s.agent.RequireCapability(ctx, "tool:search_web"); err != nil {
+//	    if err := s.agent.RequireCapability(ctx, "web:search"); err != nil {
 //	        return err
 //	    }
 //	    …

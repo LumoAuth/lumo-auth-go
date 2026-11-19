@@ -54,27 +54,32 @@ func TestContractCapabilityVector(t *testing.T) {
 }
 
 func TestCapabilityRulesInline(t *testing.T) {
-	if got := NormalizeCapability(" Tool:Search-Web "); got != "tool.search.web" {
+	if got := NormalizeCapability(" Web.Search "); got != "web:search" {
 		t.Errorf("NormalizeCapability = %q", got)
 	}
-	if got := NormalizeCapability("Ünits.Read"); got != "Ünits.read" {
+	if got := NormalizeCapability("Pull-Requests.Comment"); got != "pull-requests:comment" {
+		t.Errorf("a '-' is part of a name, not a separator: %q", got)
+	}
+	if got := NormalizeCapability("Ünits.Read"); got != "Ünits:read" {
 		t.Errorf("only ASCII letters are lower-cased, as PHP strtolower: %q", got)
 	}
 	for _, c := range []struct {
 		capability, action string
 		want               bool
 	}{
-		{"tool:search_web", "tool.search_web", true},
-		{"invoices.*", "invoices.read.draft", true},
-		{"invoices.*", "invoices", false},
-		{"*.read", "invoices.read", false},
+		{"web:search", "web.search", true},
+		{"invoices:*", "invoices:read:draft", true},
+		{"invoices.*", "invoices:read", true},
+		{"invoices:*", "invoices", false},
+		{"invoices:read", "invoices-read", false},
+		{"*:read", "invoices:read", false},
 		{"*", "", false},
 	} {
 		if got := CapabilityCovers(c.capability, c.action); got != c.want {
 			t.Errorf("CapabilityCovers(%q, %q) = %v, want %v", c.capability, c.action, got, c.want)
 		}
 	}
-	if AnyCapabilityCovers(nil, "users.view") {
+	if AnyCapabilityCovers(nil, "users:view") {
 		t.Error("an empty list covers nothing")
 	}
 }
@@ -88,7 +93,7 @@ func TestAgentHasCapabilityMatchesLikeTheServer(t *testing.T) {
 			// The server returns capabilities in their stored form.
 			writeJSON(w, 200, map[string]any{
 				"sub":          "agent_1",
-				"capabilities": []string{"tool.search_web", "invoices.*"},
+				"capabilities": []string{"web:search", "invoices:*"},
 			})
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
@@ -99,12 +104,13 @@ func TestAgentHasCapabilityMatchesLikeTheServer(t *testing.T) {
 		capability string
 		want       bool
 	}{
-		{"tool:search_web", true},  // spelled as registered
-		{"tool.search_web", true},  // stored form
-		{"invoices.approve", true}, // through invoices.*
-		{"Invoices:Read:Draft", true},
-		{"invoices", false}, // a wildcard never covers its prefix
-		{"tool:send_email", false},
+		{"web:search", true},       // stored form
+		{"web.search", true},       // '.' is folded into ':'
+		{"invoices:approve", true}, // through invoices:*
+		{"Invoices.Read.Draft", true},
+		{"invoices", false},   // a wildcard never covers its prefix
+		{"web-search", false}, // '-' is part of a name
+		{"email:send", false},
 	} {
 		got, err := agent.HasCapability(ctx, c.capability)
 		if err != nil {
@@ -114,26 +120,26 @@ func TestAgentHasCapabilityMatchesLikeTheServer(t *testing.T) {
 			t.Errorf("HasCapability(%q) = %v, want %v", c.capability, got, c.want)
 		}
 	}
-	if err := agent.RequireCapability(ctx, "tool:search_web"); err != nil {
+	if err := agent.RequireCapability(ctx, "web:search"); err != nil {
 		t.Errorf("RequireCapability on a held capability: %v", err)
 	}
-	if err := agent.RequireCapability(ctx, "tool:send_email"); !errors.Is(err, ErrPermissionDenied) {
+	if err := agent.RequireCapability(ctx, "email:send"); !errors.Is(err, ErrPermissionDenied) {
 		t.Errorf("expected ErrPermissionDenied, got %v", err)
 	}
 }
 
 func TestAccessTokenClaimsHasCapabilityMatchesLikeTheServer(t *testing.T) {
 	claims := &AccessTokenClaims{
-		Capabilities: []string{"tool.search_web", "invoices.*"},
-		Scope:        "invoices.read",
+		Capabilities: []string{"web:search", "invoices:*"},
+		Scope:        "invoices:read",
 	}
-	if !claims.HasCapability("tool:search_web") || !claims.HasCapability("invoices.approve") {
+	if !claims.HasCapability("web.search") || !claims.HasCapability("invoices:approve") {
 		t.Error("HasCapability should match the stored form and wildcards")
 	}
-	if claims.HasCapability("payments.read") {
+	if claims.HasCapability("payments:read") {
 		t.Error("HasCapability should not invent capabilities")
 	}
-	if !claims.HasScope("invoices.read") || claims.HasScope("invoices:read") {
+	if !claims.HasScope("invoices:read") || claims.HasScope("invoices.read") {
 		t.Error("scopes stay exact, as in OAuth")
 	}
 }

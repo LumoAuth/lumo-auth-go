@@ -23,8 +23,8 @@ type ConsentURLParams struct {
 	ClientID string
 	// RedirectURI is where consent returns the user. Required.
 	RedirectURI string
-	// Scopes are the permissions being requested. Defaults to
-	// ["read:documents"].
+	// Scopes are the scopes being requested. Defaults to
+	// ["documents:read"].
 	Scopes []string
 	// State is the CSRF token echoed back to the redirect URI.
 	State string
@@ -35,7 +35,7 @@ type ConsentURLParams struct {
 func (r *DelegationResource) ConsentURL(params ConsentURLParams) (string, error) {
 	scopes := params.Scopes
 	if len(scopes) == 0 {
-		scopes = []string{"read:documents"}
+		scopes = []string{"documents:read"}
 	}
 	return r.auth.AuthorizationURL(AuthorizationURLParams{
 		ClientID:    params.ClientID,

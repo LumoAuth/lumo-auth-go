@@ -19,7 +19,7 @@ type AgentsResource struct {
 // always describe the request LumoAuth received. A value you pass under one
 // of those names is kept under pep instead, as in ABAC.
 //
-//	decision, err := client.Agents.Ask(ctx, "document.read", map[string]any{"id": "doc_99"})
+//	decision, err := client.Agents.Ask(ctx, "document:read", map[string]any{"id": "doc_99"})
 //	if err != nil {
 //	    return err
 //	}
@@ -127,8 +127,8 @@ type RegisterParams struct {
 	ClientID string
 	// Description explains what the agent is for.
 	Description string
-	// Capabilities are the slugs the agent declares
-	// (e.g. "read:documents", "tool:search_web").
+	// Capabilities are the slugs the agent declares, written
+	// <resource>:<action> (e.g. "documents:read", "web:search").
 	Capabilities []string
 	// JWKSURI points at the agent's public JWKS. Required for AAuth and
 	// other proof-of-possession flows.

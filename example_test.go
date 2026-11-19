@@ -82,7 +82,7 @@ func ExampleNewAgent() {
 	}
 
 	ctx := context.Background()
-	allowed, err := agent.IsAllowed(ctx, "document.read", map[string]any{"id": "doc_99"})
+	allowed, err := agent.IsAllowed(ctx, "document:read", map[string]any{"id": "doc_99"})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func ExampleAgent_RequireCapability() {
 		log.Fatal(err)
 	}
 
-	if err := agent.RequireCapability(context.Background(), "tool:search_web"); err != nil {
+	if err := agent.RequireCapability(context.Background(), "web:search"); err != nil {
 		if errors.Is(err, lumoauth.ErrPermissionDenied) {
 			fmt.Println("this agent is not registered for web search")
 			return
@@ -201,7 +201,7 @@ func ExampleNewDelegationChain() {
 	ctx := context.Background()
 
 	// 1. Send the user here to grant consent.
-	consentURL, err := chain.ConsentURL("session-1", []string{"read:documents"}, "")
+	consentURL, err := chain.ConsentURL("session-1", []string{"documents:read"}, "")
 	if err != nil {
 		log.Fatal(err)
 	}

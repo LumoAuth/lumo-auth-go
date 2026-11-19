@@ -114,8 +114,8 @@ func (c *AccessTokenClaims) HasScope(scope string) bool {
 }
 
 // HasCapability reports whether the agent's capabilities claim covers a
-// capability. Names match as on the server ("tool:search_web" matches
-// "tool.search_web"; "invoices.*" covers "invoices.read"). Scopes are
+// capability. Names match as on the server ("web.search" matches
+// "web:search"; "invoices:*" covers "invoices:read"). Scopes are
 // different: HasScope compares them exactly.
 func (c *AccessTokenClaims) HasCapability(capability string) bool {
 	return AnyCapabilityCovers(c.Capabilities, capability)

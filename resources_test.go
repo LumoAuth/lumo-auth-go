@@ -559,12 +559,12 @@ func TestAgentsResource(t *testing.T) {
 		var calls []capture
 		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
 			"allowed":  false,
-			"action":   "document.delete",
+			"action":   "document:delete",
 			"reason":   "requires human approval",
 			"audit_id": "audit_99",
 		}))
 
-		result, err := client.Agents.Ask(ctx, "document.delete", map[string]any{"id": "doc_99"})
+		result, err := client.Agents.Ask(ctx, "document:delete", map[string]any{"id": "doc_99"})
 		if err != nil {
 			t.Fatalf("Ask: %v", err)
 		}
@@ -583,7 +583,7 @@ func TestAgentsResource(t *testing.T) {
 		var calls []capture
 		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
 			"identity":     map[string]any{"id": "agent_1", "name": "Analyser"},
-			"capabilities": []string{"read:documents"},
+			"capabilities": []string{"documents:read"},
 			"workspace":    map[string]any{"id": "ws_1"},
 		}))
 
@@ -608,7 +608,7 @@ func TestAgentsResource(t *testing.T) {
 			Name:         "Document Analyser",
 			ClientID:     "client_1",
 			Description:  "Reads quarterly reports",
-			Capabilities: []string{"read:documents"},
+			Capabilities: []string{"documents:read"},
 			JWKSURI:      "https://agent.example.com/.well-known/jwks.json",
 		})
 		if err != nil {
@@ -626,7 +626,7 @@ func TestAgentsResource(t *testing.T) {
 		var calls []capture
 		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
 			"sub":          "agent_1",
-			"capabilities": []string{"read:documents", "tool:search_web"},
+			"capabilities": []string{"documents:read", "web:search"},
 			"budget_policy": map[string]any{
 				"max_tokens_per_day": 100000,
 				"tokens_used_today":  100000,
@@ -1514,7 +1514,7 @@ func TestAuthResource(t *testing.T) {
 		if _, err := client.Auth.TokenExchange(ctx, TokenExchangeParams{
 			SubjectToken: "user-token",
 			ActorToken:   "agent-token",
-			Scopes:       []string{"read:documents"},
+			Scopes:       []string{"documents:read"},
 		}); err != nil {
 			t.Fatalf("TokenExchange: %v", err)
 		}
@@ -1543,7 +1543,7 @@ func TestAuthResource(t *testing.T) {
 		if typed.Get("actor_token_type") != TokenTypeAccessToken {
 			t.Errorf("actor_token_type = %q, want the access_token default", typed.Get("actor_token_type"))
 		}
-		if form.Get("scope") != "read:documents" {
+		if form.Get("scope") != "documents:read" {
 			t.Errorf("scope = %q", form.Get("scope"))
 		}
 		if form.Has("resource") {
@@ -1552,11 +1552,11 @@ func TestAuthResource(t *testing.T) {
 
 		// The RFC 8707 resource indicator binds the delegated token's aud.
 		if _, err := client.Delegation.ExchangeForResource(ctx, "user-token", "agent-token",
-			"https://api.example.com", "read:documents"); err != nil {
+			"https://api.example.com", "documents:read"); err != nil {
 			t.Fatalf("ExchangeForResource: %v", err)
 		}
 		bound := calls[2].Form
-		if bound.Get("resource") != "https://api.example.com" || bound.Get("scope") != "read:documents" {
+		if bound.Get("resource") != "https://api.example.com" || bound.Get("scope") != "documents:read" {
 			t.Errorf("form = %v, want the resource indicator and scope", bound)
 		}
 	})

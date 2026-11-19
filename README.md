@@ -111,7 +111,7 @@ if err != nil {
     log.Fatal(err)
 }
 
-allowed, err := agent.IsAllowed(ctx, "document.read", map[string]any{"id": "doc_99"})
+allowed, err := agent.IsAllowed(ctx, "document:read", map[string]any{"id": "doc_99"})
 if err != nil {
     log.Fatal(err)
 }
@@ -488,7 +488,7 @@ err = client.Auth.Revoke(ctx, lumoauth.RevokeParams{
 })
 
 // Machine-to-machine: the client credentials grant.
-m2m, err := client.Auth.ClientCredentials(ctx, clientID, clientSecret, "read:reports")
+m2m, err := client.Auth.ClientCredentials(ctx, clientID, clientSecret, "reports:read")
 ```
 
 Set `AccessType: "offline"` on `AuthorizationURLParams` to ask for a refresh token.
@@ -517,7 +517,7 @@ if _, err := agent.Authenticate(ctx); err != nil {
 Ask before an action. Use this before an LLM calls a tool:
 
 ```go
-result, err := agent.Ask(ctx, "tickets.read", map[string]any{"ticket": "T-1042"})
+result, err := agent.Ask(ctx, "tickets:read", map[string]any{"ticket": "T-1042"})
 if err != nil {
     return err
 }
@@ -534,9 +534,9 @@ Check capabilities and the budget:
 
 ```go
 // Returns an error that matches ErrPermissionDenied when the capability is missing.
-// Names match as on the server: "tool:search_web" matches the stored
-// "tool.search_web", and a held "tool.*" covers it.
-if err := agent.RequireCapability(ctx, "tool:search_web"); err != nil {
+// Names match as on the server: "Web:Search" matches the held
+// "web:search", and a held "web:*" covers it.
+if err := agent.RequireCapability(ctx, "web:search"); err != nil {
     return err
 }
 
@@ -699,7 +699,7 @@ exchange (RFC 8693). `DelegationChain` manages the whole flow for one session ID
 chain := lumoauth.NewDelegationChain(agent, "https://agent.example.com/callback")
 
 // 1. Send the user to the consent page.
-consentURL, err := chain.ConsentURL("session-1", []string{"read:documents"}, "")
+consentURL, err := chain.ConsentURL("session-1", []string{"documents:read"}, "")
 
 // 2. Your callback receives ?code=...
 err = chain.HandleConsentCallback(ctx, "session-1", code)
@@ -709,7 +709,7 @@ var out map[string]any
 err = chain.Do(ctx, "session-1", http.MethodGet, "/orgs/acme-corp/api/v1/documents", nil, &out)
 
 // Hand the delegation to a sub-agent. A chain is at most 3 agents deep.
-subToken, err := chain.DelegateToSubAgent(ctx, "session-1", subAgentToken, "read:documents")
+subToken, err := chain.DelegateToSubAgent(ctx, "session-1", subAgentToken, "documents:read")
 
 // End the delegation. This revokes the refresh token and every token made from it.
 err = chain.Revoke(ctx, "session-1")
@@ -724,7 +724,7 @@ RFC 8707 resource indicator. It becomes the token's `aud` claim. Without it, the
 token is bound to the acting agent's own ID.
 
 ```go
-token, err := chain.ExchangeForResource(ctx, "session-1", "https://api.example.com", "read:documents")
+token, err := chain.ExchangeForResource(ctx, "session-1", "https://api.example.com", "documents:read")
 ```
 
 LumoAuth does not set `aud` from the `audience` parameter. Send one resource URL per exchange.
@@ -737,7 +737,7 @@ resp, err := client.Auth.TokenExchange(ctx, lumoauth.TokenExchangeParams{
     SubjectTokenType: lumoauth.TokenTypeIDToken,
     ActorToken:       agentToken,
     Resource:         "https://api.example.com",
-    Scopes:           []string{"read:documents"},
+    Scopes:           []string{"documents:read"},
 })
 ```
 

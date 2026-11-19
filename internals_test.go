@@ -551,7 +551,7 @@ func TestAgentAskAndIdentityCaching(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/oauth/token"):
 			writeJSON(w, 200, map[string]any{"access_token": "t", "expires_in": 3600})
 		case strings.HasSuffix(r.URL.Path, "/agents/ask"):
-			writeJSON(w, 200, map[string]any{"allowed": true, "action": "document.read"})
+			writeJSON(w, 200, map[string]any{"allowed": true, "action": "document:read"})
 		case strings.HasSuffix(r.URL.Path, "/agents/me"):
 			identityCalls++
 			writeJSON(w, 200, map[string]any{
@@ -564,7 +564,7 @@ func TestAgentAskAndIdentityCaching(t *testing.T) {
 
 	ctx := context.Background()
 
-	result, err := agent.Ask(ctx, "document.read", nil)
+	result, err := agent.Ask(ctx, "document:read", nil)
 	if err != nil {
 		t.Fatalf("Ask: %v", err)
 	}

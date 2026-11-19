@@ -57,7 +57,7 @@ func (s *delegationServer) handler() http.HandlerFunc {
 					"access_token":  "user-token",
 					"refresh_token": "user-refresh",
 					"expires_in":    expiresIn,
-					"scope":         "read:documents",
+					"scope":         "documents:read",
 				})
 
 			case "refresh_token":
@@ -112,7 +112,7 @@ func newTestChain(t *testing.T, state *delegationServer) (*DelegationChain, *htt
 func TestDelegationChainConsentURL(t *testing.T) {
 	chain, server := newTestChain(t, &delegationServer{})
 
-	got, err := chain.ConsentURL("session-1", []string{"read:documents", "write:documents"}, "")
+	got, err := chain.ConsentURL("session-1", []string{"documents:read", "documents:write"}, "")
 	if err != nil {
 		t.Fatalf("ConsentURL: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestDelegationChainConsentURL(t *testing.T) {
 	}
 
 	query := parsed.Query()
-	if query.Get("scope") != "read:documents write:documents" {
+	if query.Get("scope") != "documents:read documents:write" {
 		t.Errorf("scope = %q", query.Get("scope"))
 	}
 	if query.Get("state") != "session:session-1" {
@@ -138,6 +138,22 @@ func TestDelegationChainConsentURL(t *testing.T) {
 	// Offline access is what gets the agent a refresh token.
 	if query.Get("access_type") != "offline" || query.Get("prompt") != "consent" {
 		t.Errorf("the consent URL must request offline access: %v", query)
+	}
+}
+
+func TestDelegationChainConsentURLDefaultScope(t *testing.T) {
+	chain, _ := newTestChain(t, &delegationServer{})
+
+	got, err := chain.ConsentURL("session-1", nil, "")
+	if err != nil {
+		t.Fatalf("ConsentURL: %v", err)
+	}
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("parsing the URL: %v", err)
+	}
+	if scope := parsed.Query().Get("scope"); scope != "documents:read" {
+		t.Errorf("scope = %q, want the documents:read default", scope)
 	}
 }
 
@@ -300,7 +316,7 @@ func TestDelegationChainNestedDelegation(t *testing.T) {
 		t.Fatalf("HandleConsentCallback: %v", err)
 	}
 
-	if _, err := chain.DelegateToSubAgent(ctx, "session-1", "sub-agent-token", "read:documents"); err != nil {
+	if _, err := chain.DelegateToSubAgent(ctx, "session-1", "sub-agent-token", "documents:read"); err != nil {
 		t.Fatalf("DelegateToSubAgent: %v", err)
 	}
 
@@ -316,7 +332,7 @@ func TestDelegationChainNestedDelegation(t *testing.T) {
 	if nested.Get("actor_token") != "sub-agent-token" {
 		t.Errorf("actor_token = %q", nested.Get("actor_token"))
 	}
-	if nested.Get("scope") != "read:documents" {
+	if nested.Get("scope") != "documents:read" {
 		t.Errorf("scope = %q, want the narrowed scope", nested.Get("scope"))
 	}
 }
@@ -350,7 +366,7 @@ func TestDelegationChainOtherExchangeErrorsAreAnnotated(t *testing.T) {
 		exchangeStatus: http.StatusForbidden,
 		exchangeBody: map[string]any{
 			"error":             "insufficient_scope",
-			"error_description": "agent lacks delegate:on_behalf",
+			"error_description": "Agent is not authorized to act on behalf of users",
 		},
 	}
 	chain, _ := newTestChain(t, state)
@@ -366,7 +382,7 @@ func TestDelegationChainOtherExchangeErrorsAreAnnotated(t *testing.T) {
 	if !strings.Contains(err.Error(), "token exchange failed") {
 		t.Errorf("the error should say which step failed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "delegate:on_behalf") {
+	if !strings.Contains(err.Error(), "act on behalf of users") {
 		t.Errorf("the server's description should survive: %v", err)
 	}
 }
