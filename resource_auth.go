@@ -65,7 +65,7 @@ func (r *AuthResource) AuthorizationURL(params AuthorizationURLParams) (string, 
 		return "", NewValidationError("RedirectURI is required to build an authorization URL")
 	}
 
-	_, path, err := r.http.resolve(RouteOAuthAuthorize, nil)
+	authorizeURL, err := r.http.routeURL(RouteOAuthAuthorize, nil)
 	if err != nil {
 		return "", err
 	}
@@ -105,7 +105,7 @@ func (r *AuthResource) AuthorizationURL(params AuthorizationURLParams) (string, 
 		query.Set(key, value)
 	}
 
-	return r.http.baseURL + path + "?" + query.Encode(), nil
+	return authorizeURL + "?" + query.Encode(), nil
 }
 
 // ExchangeCodeParams describes an authorization-code exchange.

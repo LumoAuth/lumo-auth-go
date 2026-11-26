@@ -241,10 +241,12 @@ func (s *ClientAssertionSigner) PrivateKeyPEM() (string, error) {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})), nil
 }
 
-// IssuerFor is the issuer identifier of an organization on baseURL: the
-// issuer of /orgs/{orgID}/api/v1/.well-known/openid-configuration, and the
-// aud a client assertion must carry. On a custom domain the issuer differs;
-// set it explicitly there.
+// IssuerFor is the issuer identifier of an organization on the platform
+// host baseURL: the issuer of
+// /orgs/{orgID}/api/v1/.well-known/openid-configuration, and the aud a
+// client assertion must carry. On a custom domain the issuer is the bare
+// domain, for example "https://auth.acme.com"; Client.Issuer returns the
+// right form for a client.
 func IssuerFor(baseURL, orgID string) string {
 	return strings.TrimRight(baseURL, "/") + "/orgs/" + orgID + "/api/v1"
 }

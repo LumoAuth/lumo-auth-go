@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,8 +23,26 @@ type AAuthConfig struct {
 	// BaseURL is the LumoAuth instance. Defaults to $LUMOAUTH_URL, then
 	// DefaultBaseURL.
 	BaseURL string
-	// OrgID is the organization slug. Defaults to $LUMOAUTH_ORG_ID.
+	// OrgID is the organization slug. Defaults to $LUMOAUTH_ORG_ID. Not
+	// needed with CustomDomain.
 	OrgID string
+	// CustomDomain addresses the organization on its own domain, for
+	// example "auth.acme.com". Defaults to $LUMOAUTH_CUSTOM_DOMAIN. It wins
+	// over BaseURL: the token endpoint, the key set, the issuer metadata
+	// and the URLs that the agent signs are then on that domain, without
+	// the /orgs/{orgId} segment. See WithCustomDomain.
+	//
+	// The AAuth issuer does not follow the domain: see Issuer.
+	CustomDomain string
+	// Issuer is the organization's AAuth issuer: the `iss` of its AAuth
+	// tokens and the audience that the agent addresses. Leave it empty on
+	// the platform host, where it is {BaseURL}/orgs/{OrgID}/api/v1.
+	//
+	// LumoAuth names the AAuth issuer with the platform address on every
+	// host, so with CustomDomain it is NOT the bare domain. When Issuer is
+	// empty there, ResolveIssuer reads it from the issuer metadata
+	// document of the custom domain.
+	Issuer string
 	// Kid identifies the key in the JWKS registered with LumoAuth.
 	// Defaults to DefaultKid.
 	Kid string
@@ -63,11 +82,18 @@ type AAuthConfig struct {
 type AAuthClient struct {
 	agentIdentifier string
 	baseURL         string
+	customDomain    string
+	issuer          string // AAuthConfig.Issuer
 	orgID           string
 	kid             string
 	privateKeyPEM   string
 	signer          crypto.Signer
 	http            *httpClient
+
+	// issuerMu guards discoveredIssuer, the issuer that ResolveIssuer read
+	// from the metadata document of a custom domain.
+	issuerMu         sync.Mutex
+	discoveredIssuer string
 }
 
 // NewAAuthClient builds an AAuth client and parses the agent's private key.
@@ -83,17 +109,28 @@ func NewAAuthClient(cfg AAuthConfig) (*AAuthClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	customDomain, err := customDomainFrom(cfg.CustomDomain)
+	if err != nil {
+		return nil, err
+	}
 
 	client := &AAuthClient{
 		agentIdentifier: cfg.AgentIdentifier,
 		baseURL:         strings.TrimRight(firstNonEmpty(cfg.BaseURL, os.Getenv(EnvBaseURL), DefaultBaseURL), "/"),
+		customDomain:    customDomain,
+		issuer:          strings.TrimSpace(cfg.Issuer),
 		orgID:           firstNonEmpty(cfg.OrgID, os.Getenv(EnvOrgID)),
 		kid:             firstNonEmpty(cfg.Kid, DefaultKid),
 		privateKeyPEM:   cfg.PrivateKeyPEM,
 		signer:          signer,
 	}
+	if customDomain != "" {
+		// The custom domain wins: the base URL is not used for any request.
+		client.baseURL = customDomain
+	}
 
 	client.http = newHTTPClient(client.baseURL)
+	client.http.customDomain = customDomain
 	client.http.orgID = client.orgID
 	client.http.userAgent = userAgent()
 	if cfg.HTTPClient != nil {
@@ -114,17 +151,87 @@ func NewAAuthClient(cfg AAuthConfig) (*AAuthClient, error) {
 // AgentIdentifier returns the agent's identity URL.
 func (c *AAuthClient) AgentIdentifier() string { return c.agentIdentifier }
 
-// BaseURL returns the LumoAuth instance URL.
+// BaseURL returns the address that the client sends its requests to: the
+// custom domain when one is set, the LumoAuth instance URL otherwise.
 func (c *AAuthClient) BaseURL() string { return c.baseURL }
 
 // OrgID returns the organization slug.
 func (c *AAuthClient) OrgID() string { return c.orgID }
 
-// Issuer returns the organization's AAuth issuer URL —
-// {baseURL}/orgs/{orgID}/api/v1 — which is the `iss` value in issued
-// tokens and the base for JWKS discovery.
+// CustomDomain returns the organization's custom domain as an origin, or
+// "" when none is set.
+func (c *AAuthClient) CustomDomain() string { return c.customDomain }
+
+// Issuer returns the organization's AAuth issuer URL, which is the `iss`
+// value in issued tokens and the audience that the agent addresses.
+//
+// It returns AAuthConfig.Issuer when that is set. On the platform host it
+// is otherwise {baseURL}/orgs/{orgID}/api/v1, the base for JWKS discovery.
+//
+// On a custom domain the issuer keeps the platform form, and this method
+// never derives it from the domain. It makes no request, so there it
+// returns the value that ResolveIssuer has read, or "" before the first
+// call of ResolveIssuer. Prefer ResolveIssuer with a custom domain.
 func (c *AAuthClient) Issuer() string {
+	if c.issuer != "" {
+		return c.issuer
+	}
+	if c.customDomain != "" {
+		c.issuerMu.Lock()
+		defer c.issuerMu.Unlock()
+		return c.discoveredIssuer
+	}
 	return c.baseURL + "/orgs/" + url.PathEscape(c.orgID) + "/api/v1"
+}
+
+// ResolveIssuer returns the organization's AAuth issuer, like Issuer, and
+// reads it from LumoAuth when the client cannot know it.
+//
+// With a custom domain and no AAuthConfig.Issuer, it fetches the issuer
+// metadata document from the custom domain once and returns its `issuer`
+// member, which is the platform form. Later calls return the same value
+// without a request. On the platform host it makes no request, and it
+// returns a *ConfigError when the client has no organization ID.
+func (c *AAuthClient) ResolveIssuer(ctx context.Context) (string, error) {
+	if c.issuer != "" {
+		return c.issuer, nil
+	}
+	if c.customDomain == "" {
+		if c.orgID == "" {
+			return "", NewConfigError(
+				"an org ID is required for the AAuth issuer — set OrgID or LUMOAUTH_ORG_ID, or set Issuer")
+		}
+		return c.Issuer(), nil
+	}
+
+	c.issuerMu.Lock()
+	known := c.discoveredIssuer
+	c.issuerMu.Unlock()
+	if known != "" {
+		return known, nil
+	}
+	metadata, err := c.DiscoverIssuer(ctx)
+	if err != nil {
+		return "", err
+	}
+	issuer, err := aauthIssuerFromMetadata(metadata.Issuer)
+	if err != nil {
+		return "", err
+	}
+	c.issuerMu.Lock()
+	c.discoveredIssuer = issuer
+	c.issuerMu.Unlock()
+	return issuer, nil
+}
+
+// aauthIssuerFromMetadata checks the `issuer` member of an AAuth issuer
+// metadata document: an absolute http(s) URL.
+func aauthIssuerFromMetadata(issuer string) (string, error) {
+	parsed, err := url.Parse(issuer)
+	if issuer == "" || err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return "", NewValidationError("the AAuth issuer metadata document names no usable issuer")
+	}
+	return issuer, nil
 }
 
 // PublicJWK returns the agent's public key as a JWK, tagged with its kid.
@@ -544,17 +651,15 @@ func (c *AAuthClient) requireAgentToken(agentToken string) error {
 	return nil
 }
 
-// routeURL builds the absolute URL for an org-scoped route.
+// routeURL builds the absolute URL for an org-scoped route. It is the URL
+// that the agent's HTTP message signature covers. On a custom domain it has
+// no /orgs/{orgId} segment and needs no organization ID.
 func (c *AAuthClient) routeURL(routeName string) (string, error) {
-	if c.orgID == "" {
+	if c.orgID == "" && c.customDomain == "" {
 		return "", NewConfigError(
-			"an org ID is required for AAuth operations — set OrgID or LUMOAUTH_ORG_ID")
+			"an org ID is required for AAuth operations — set OrgID or LUMOAUTH_ORG_ID, or set CustomDomain")
 	}
-	path, err := RoutePath(routeName, map[string]string{"orgId": c.orgID})
-	if err != nil {
-		return "", err
-	}
-	return c.baseURL + path, nil
+	return c.http.routeURL(routeName, nil)
 }
 
 // tokenRequest posts a signed request to the agent token endpoint.

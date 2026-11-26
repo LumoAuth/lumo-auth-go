@@ -411,11 +411,8 @@ func randomJTI() (string, error) {
 }
 
 // dpopTokenURL is the absolute token endpoint URL for the transport's base
-// URL and org — the `htu` of a token-endpoint proof.
+// URL and org — the `htu` of a token-endpoint proof. On a custom domain it
+// is the prefix-less address on that domain.
 func (c *httpClient) dpopTokenURL() (string, error) {
-	_, path, err := c.resolve(RouteOAuthToken, nil)
-	if err != nil {
-		return "", err
-	}
-	return c.baseURL + path, nil
+	return c.routeURL(RouteOAuthToken, nil)
 }

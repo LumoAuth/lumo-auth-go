@@ -71,8 +71,21 @@ func (c *AAuthClaims) HasScope(scope string) bool {
 // VerifyOptions configures VerifyAuthToken.
 type VerifyOptions struct {
 	// Issuer is the trusted issuer URL, e.g.
-	// "https://app.lumoauth.dev/orgs/acme-corp/api/v1". Required.
+	// "https://app.lumoauth.dev/orgs/acme-corp/api/v1". Required unless
+	// CustomDomain is set.
 	Issuer string
+	// CustomDomain is the organization's custom domain, for example
+	// "auth.acme.com". When it is set, the key set is fetched from
+	// {domain}/api/v1/aauth/jwks.json. The value follows the rules of
+	// WithCustomDomain. The environment is not read.
+	//
+	// The trusted issuer is NOT the bare domain: LumoAuth names the AAuth
+	// issuer with the platform address on every host. With CustomDomain
+	// and an empty Issuer, VerifyAuthToken reads the issuer from the
+	// issuer metadata document of the custom domain
+	// ({domain}/api/v1/.well-known/aauth-issuer) and keeps it for an hour.
+	// A non-empty Issuer is used as it is, and no document is read.
+	CustomDomain string
 	// Resource is your resource identifier; it must equal the token's
 	// audience. Required.
 	Resource string
@@ -103,8 +116,9 @@ type VerifyOptions struct {
 // HMAC and "none" algorithms are always rejected, and the algorithm must
 // match the key type published in the JWKS.
 func VerifyAuthToken(ctx context.Context, token string, opts VerifyOptions) (*AAuthClaims, error) {
-	if opts.Issuer == "" {
-		return nil, NewConfigError("Issuer is required to verify an auth token")
+	source, err := opts.issuerSource()
+	if err != nil {
+		return nil, err
 	}
 	if opts.Resource == "" {
 		return nil, NewConfigError("Resource is required to verify an auth token")
@@ -132,14 +146,21 @@ func VerifyAuthToken(ctx context.Context, token string, opts VerifyOptions) (*AA
 	if err != nil {
 		return nil, err
 	}
-	// Check the issuer before fetching anything from it.
-	if issuer, _ := claimsMap["iss"].(string); issuer != opts.Issuer {
+	// Check the issuer before fetching any key. With a custom domain and no
+	// configured issuer, the trusted issuer is read from the domain's own
+	// metadata document first; nothing is fetched from an address that the
+	// token names.
+	trustedIssuer, err := source.issuer(ctx, opts.HTTPClient)
+	if err != nil {
+		return nil, err
+	}
+	if issuer, _ := claimsMap["iss"].(string); issuer != trustedIssuer {
 		return nil, validationErrorf("untrusted issuer %q", claimsMap["iss"])
 	}
 
 	jwks := opts.JWKS
 	if jwks == nil {
-		if jwks, err = FetchIssuerJWKS(ctx, opts.Issuer, opts.HTTPClient); err != nil {
+		if jwks, err = fetchAAuthJWKS(ctx, source.jwksURL, opts.HTTPClient); err != nil {
 			return nil, err
 		}
 	}
@@ -264,17 +285,128 @@ func (c *AAuthClaims) VerifyProofOfPossession(r *http.Request, body []byte) erro
 	return nil
 }
 
+// aauthIssuerSource says where the trusted AAuth issuer and its key set
+// come from. It is built from the options without a request.
+type aauthIssuerSource struct {
+	// configured is VerifyOptions.Issuer.
+	configured string
+	// metadataURL is the issuer metadata document of a custom domain. The
+	// issuer is read from it when configured is empty.
+	metadataURL string
+	// jwksURL is the address of the key set.
+	jwksURL string
+}
+
+// issuerSource validates the options. On the platform host the issuer is
+// Issuer and the key set is below it. On a custom domain the key set and
+// the metadata document are the routes aauth.jwks and aauth.issuerMetadata
+// as that domain serves them; the issuer is never the domain itself.
+func (o VerifyOptions) issuerSource() (*aauthIssuerSource, error) {
+	customDomain, err := normalizeCustomDomain(o.CustomDomain)
+	if err != nil {
+		return nil, err
+	}
+	if customDomain != "" {
+		transport := &httpClient{baseURL: customDomain, customDomain: customDomain}
+		jwksURL, err := transport.routeURL(RouteAAuthJWKS, nil)
+		if err != nil {
+			return nil, err
+		}
+		metadataURL, err := transport.routeURL(RouteAAuthIssuerMetadata, nil)
+		if err != nil {
+			return nil, err
+		}
+		return &aauthIssuerSource{configured: o.Issuer, metadataURL: metadataURL, jwksURL: jwksURL}, nil
+	}
+	if o.Issuer == "" {
+		return nil, NewConfigError("Issuer is required to verify an auth token (or CustomDomain, for an organization on its own domain)")
+	}
+	return &aauthIssuerSource{configured: o.Issuer, jwksURL: strings.TrimRight(o.Issuer, "/") + aauthJWKSPath}, nil
+}
+
+// issuer returns the issuer that an auth token must name: the configured
+// one, or the `issuer` member of the custom domain's metadata document.
+func (s *aauthIssuerSource) issuer(ctx context.Context, httpClient *http.Client) (string, error) {
+	if s.configured != "" {
+		return s.configured, nil
+	}
+	return sharedAAuthIssuers.get(ctx, s.metadataURL, httpClient)
+}
+
+// aauthIssuerCache keeps the issuer that each metadata document named.
+type aauthIssuerCache struct {
+	mu      sync.Mutex
+	entries map[string]aauthIssuerEntry
+}
+
+type aauthIssuerEntry struct {
+	issuer    string
+	expiresAt time.Time
+}
+
+// aauthIssuerTTL is how long an issuer that was read from a metadata
+// document is used before the document is read again.
+const aauthIssuerTTL = time.Hour
+
+var sharedAAuthIssuers = &aauthIssuerCache{entries: map[string]aauthIssuerEntry{}}
+
+func (c *aauthIssuerCache) get(ctx context.Context, metadataURL string, httpClient *http.Client) (string, error) {
+	c.mu.Lock()
+	entry, ok := c.entries[metadataURL]
+	c.mu.Unlock()
+	if ok && time.Now().Before(entry.expiresAt) {
+		return entry.issuer, nil
+	}
+
+	transport := newHTTPClient("")
+	transport.userAgent = userAgent()
+	if httpClient != nil {
+		transport.doer = httpClient
+	}
+	var metadata AAuthIssuerMetadata
+	if err := transport.do(ctx, http.MethodGet, metadataURL, &request{NoAuth: true}, &metadata); err != nil {
+		return "", err
+	}
+	issuer, err := aauthIssuerFromMetadata(metadata.Issuer)
+	if err != nil {
+		return "", err
+	}
+
+	c.mu.Lock()
+	c.entries[metadataURL] = aauthIssuerEntry{issuer: issuer, expiresAt: time.Now().Add(aauthIssuerTTL)}
+	c.mu.Unlock()
+	return issuer, nil
+}
+
+// aauthJWKSPath is the path of the AAuth key set below a platform issuer.
+const aauthJWKSPath = "/aauth/jwks.json"
+
+// customDomainAAuthJWKSURL is the AAuth key set of a custom domain: the
+// route aauth.jwks as that domain serves it.
+func customDomainAAuthJWKSURL(customDomain string) (string, error) {
+	transport := &httpClient{baseURL: customDomain, customDomain: customDomain}
+	return transport.routeURL(RouteAAuthJWKS, nil)
+}
+
 // FetchIssuerJWKS retrieves an AAuth issuer's signing keys from
-// {issuer}/aauth/jwks.json.
+// {issuer}/aauth/jwks.json. The AAuth issuer has the platform form on
+// every host, so this address is on the platform host. To read the keys
+// from an organization's custom domain, use NewJWKSCacheForCustomDomain or
+// VerifyOptions.CustomDomain.
 func FetchIssuerJWKS(ctx context.Context, issuer string, httpClient *http.Client) (*JWKS, error) {
-	transport := newHTTPClient(strings.TrimRight(issuer, "/"))
+	return fetchAAuthJWKS(ctx, strings.TrimRight(issuer, "/")+aauthJWKSPath, httpClient)
+}
+
+// fetchAAuthJWKS retrieves an AAuth key set from its address.
+func fetchAAuthJWKS(ctx context.Context, jwksURL string, httpClient *http.Client) (*JWKS, error) {
+	transport := newHTTPClient("")
 	transport.userAgent = userAgent()
 	if httpClient != nil {
 		transport.doer = httpClient
 	}
 
 	var jwks JWKS
-	if err := transport.do(ctx, http.MethodGet, "/aauth/jwks.json", &request{NoAuth: true}, &jwks); err != nil {
+	if err := transport.do(ctx, http.MethodGet, jwksURL, &request{NoAuth: true}, &jwks); err != nil {
 		return nil, err
 	}
 	if len(jwks.Keys) == 0 {
@@ -287,7 +419,7 @@ func FetchIssuerJWKS(ctx context.Context, issuer string, httpClient *http.Client
 // verifies tokens without fetching keys on every request. The zero value
 // is not usable — build one with NewJWKSCache.
 type JWKSCache struct {
-	issuer     string
+	jwksURL    string
 	ttl        time.Duration
 	httpClient *http.Client
 
@@ -301,7 +433,29 @@ func NewJWKSCache(issuer string, ttl time.Duration, httpClient *http.Client) *JW
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	return &JWKSCache{issuer: issuer, ttl: ttl, httpClient: httpClient}
+	return &JWKSCache{jwksURL: strings.TrimRight(issuer, "/") + aauthJWKSPath, ttl: ttl, httpClient: httpClient}
+}
+
+// NewJWKSCacheForCustomDomain builds a cache that reads the AAuth key set
+// from an organization's custom domain, for example "auth.acme.com", at
+// /api/v1/aauth/jwks.json. It returns a *ConfigError for a value that is
+// empty or not valid (see WithCustomDomain). A ttl of 0 means one hour.
+func NewJWKSCacheForCustomDomain(customDomain string, ttl time.Duration, httpClient *http.Client) (*JWKSCache, error) {
+	normalized, err := normalizeCustomDomain(customDomain)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == "" {
+		return nil, NewConfigError("a custom domain is required, for example \"auth.acme.com\"")
+	}
+	jwksURL, err := customDomainAAuthJWKSURL(normalized)
+	if err != nil {
+		return nil, err
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	return &JWKSCache{jwksURL: jwksURL, ttl: ttl, httpClient: httpClient}, nil
 }
 
 // Get returns the cached key set, fetching it when absent or stale.
@@ -314,7 +468,7 @@ func (c *JWKSCache) Get(ctx context.Context) (*JWKS, error) {
 	}
 	c.mu.Unlock()
 
-	keys, err := FetchIssuerJWKS(ctx, c.issuer, c.httpClient)
+	keys, err := fetchAAuthJWKS(ctx, c.jwksURL, c.httpClient)
 	if err != nil {
 		return nil, err
 	}

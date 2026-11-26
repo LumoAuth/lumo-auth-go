@@ -69,6 +69,11 @@ const (
 	// ── MCP (per-tool checks asked by an MCP server) ──────────────────
 	RouteMcpAuthorizeTool = "mcp.authorizeTool"
 
+	// ── Personal Agent Protocol (Session verification for your own API) ─
+	RoutePoppyVerifyRequest    = "poppy.verifyRequest"
+	RoutePoppyGetSessionStatus = "poppy.getSessionStatus"
+	RoutePoppyEndSession       = "poppy.endSession"
+
 	// ── Approvals (push-approval-for-actions) ─────────────────────────
 	RouteApprovalsCreate = "approvals.create"
 	RouteApprovalsStatus = "approvals.status"
@@ -96,6 +101,21 @@ const (
 
 // orgBase is the org-scoped API prefix shared by most routes.
 const orgBase = "/orgs/{orgId}/api/v1"
+
+// orgSegment is the path segment that names the organization on the
+// platform host. A custom domain serves every route without it.
+const orgSegment = "/orgs/{orgId}"
+
+// pathOnCustomDomain returns a route's path template as an organization's
+// custom domain serves it: without the leading /orgs/{orgId} segment. A
+// template without that segment is returned unchanged. The registry keeps
+// the platform form; this is the only place that knows the other one.
+func pathOnCustomDomain(template string) string {
+	if rest, ok := strings.CutPrefix(template, orgSegment); ok && strings.HasPrefix(rest, "/") {
+		return rest
+	}
+	return template
+}
 
 // Routes maps every route name to its method and path template.
 var Routes = map[string]Route{
@@ -143,6 +163,13 @@ var Routes = map[string]Route{
 	// ── MCP ───────────────────────────────────────────────────────────
 	RouteMcpAuthorizeTool: {"POST", orgBase + "/mcp/servers/{serverId}/tools/authorize"},
 
+	// ── Personal Agent Protocol ───────────────────────────────────────
+	// Authenticated with HTTP Basic (client ID and secret), never with the
+	// client's bearer token or API key. See PoppyResource.
+	RoutePoppyVerifyRequest:    {"POST", orgBase + "/poppy/sessions/verify"},
+	RoutePoppyGetSessionStatus: {"POST", orgBase + "/poppy/sessions/status"},
+	RoutePoppyEndSession:       {"POST", orgBase + "/poppy/sessions/end"},
+
 	// ── Approvals ─────────────────────────────────────────────────────
 	RouteApprovalsCreate: {"POST", orgBase + "/agents/me/approvals"},
 	RouteApprovalsStatus: {"GET", orgBase + "/agents/me/approvals/{token}/status"},
@@ -182,7 +209,9 @@ func RouteNames() []string {
 }
 
 // BuildPath fills `{param}` placeholders in a path template. Values are
-// URL-escaped.
+// URL-escaped. The registry's templates are in the platform form, with the
+// /orgs/{orgId} segment; a client with a custom domain removes that segment
+// before it builds the path.
 //
 //	BuildPath("/orgs/{orgId}/api/v1/abac/check", map[string]string{"orgId": "acme-corp"})
 //	// → "/orgs/acme-corp/api/v1/abac/check"
@@ -217,7 +246,9 @@ func BuildPath(template string, params map[string]string) (string, error) {
 	}
 }
 
-// RoutePath looks up a route and builds its concrete path in one call.
+// RoutePath looks up a route and builds its concrete path in one call. The
+// path is in the platform form. A client with a custom domain does not
+// use this function: it resolves routes without the /orgs/{orgId} segment.
 func RoutePath(name string, params map[string]string) (string, error) {
 	route, ok := Routes[name]
 	if !ok {

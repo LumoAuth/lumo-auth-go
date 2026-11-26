@@ -2,7 +2,7 @@
 Package lumoauth is the official Go SDK for LumoAuth — authentication and
 authorization for applications and AI agents.
 
-It exposes four entry points, one per kind of caller:
+It exposes these entry points, one per kind of caller:
 
   - [Client] — the general-purpose API client. Permission checks (RBAC,
     ReBAC, ABAC), agent identity, delegation, JIT permissions, approvals,
@@ -24,6 +24,11 @@ It exposes four entry points, one per kind of caller:
   - [WebAuth] — browser sign-in. Wires the OAuth 2.1 Authorization Code +
     PKCE flow into any net/http-compatible router, with sessions in a
     signed cookie.
+
+  - [PoppyResource] (client.Poppy) — for an API that personal agents call
+    (Personal Agent Protocol). It asks LumoAuth to verify the Poppy-Session
+    header of a request, and [PoppyResource.Middleware] does that for a
+    net/http route.
 
 # Client
 
@@ -103,6 +108,38 @@ acting on behalf of a user, use a [DelegationChain].
 	// In a handler:
 	user := lumoauth.UserFromContext(req.Context())
 
+# Personal agents
+
+An API that personal agents call verifies each request with LumoAuth. The
+client authenticates as a confidential application whose allowed scopes
+include poppy:verify:
+
+	client, err := lumoauth.New(
+	    lumoauth.WithOrgID("acme-corp"),
+	    lumoauth.WithClientCredentials(clientID, clientSecret),
+	)
+	if err != nil {
+	    return err
+	}
+
+	verified, err := client.Poppy.Middleware(lumoauth.PoppyMiddlewareOptions{
+	    PublicOrigin:  "https://shop.example.com", // from your configuration
+	    RequiredScope: []string{"orders:read"},
+	})
+	if err != nil {
+	    return err
+	}
+	mux.Handle("GET /api/orders", verified(ordersHandler))
+
+	// In a handler:
+	who, _ := lumoauth.PoppyFromContext(req.Context())
+
+A refused request gets LumoAuth's response, unchanged. A failed
+verification call is never sent to the personal agent. [PoppyResource.VerifyRequest]
+and [WritePoppyRefusal] are the same steps without the middleware, and
+[PoppyResource.GetSessionStatus] and [PoppyResource.EndSession] look up and
+end a Session.
+
 # Errors
 
 Every error this package returns is matched with the standard library
@@ -124,13 +161,37 @@ The sentinels are [ErrAuthentication], [ErrPermissionDenied],
 [ErrLumoAuth] matches all of them. The names and codes are shared with the
 JS and Python SDKs.
 
+# Custom domains
+
+An organization can serve LumoAuth on its own domain. Pass the domain with
+[WithCustomDomain], or with the CustomDomain field of [AgentConfig],
+[WebConfig] and [AAuthConfig]:
+
+	client, err := lumoauth.New(
+	    lumoauth.WithCustomDomain("auth.acme.com"),
+	    lumoauth.WithAPIKey(os.Getenv("LUMOAUTH_API_KEY")),
+	)
+
+The client then sends every request to that domain, and no path carries the
+/orgs/{orgId} segment. The organization ID is not needed. The issuer is the
+bare domain, https://auth.acme.com, and [Client.Issuer] returns it. To
+verify access tokens of such an organization, set CustomDomain in
+[AccessTokenVerifyOptions] in place of Issuer.
+
+AAuth is the one exception. LumoAuth names the AAuth issuer with the
+platform address on every host, so the SDK never derives it from the
+domain. [AAuthClient.ResolveIssuer] and [VerifyAuthToken] with
+VerifyOptions.CustomDomain read it from the issuer metadata document of the
+custom domain.
+
 # Configuration
 
 Options fall back to the environment:
 
 	LUMOAUTH_URL           instance URL      (default https://app.lumoauth.dev)
 	LUMOAUTH_ORG_ID        organization slug
-	LUMOAUTH_API_KEY       tenant API key    (sent as X-API-Key)
+	LUMOAUTH_CUSTOM_DOMAIN the organization's own domain (wins over LUMOAUTH_URL)
+	LUMOAUTH_API_KEY       organization API key (sent as X-API-Key)
 	AGENT_CLIENT_ID        agent OAuth client       (Agent only)
 	AGENT_CLIENT_SECRET    agent OAuth secret       (Agent only)
 

@@ -531,3 +531,174 @@ type AgentMcpToolDecision struct {
 	AgentID  string          `json:"agent_id,omitempty"`
 	Resource McpToolResource `json:"resource"`
 }
+
+// ── Personal Agent Protocol ───────────────────────────────────────────
+
+// PoppyVerification is the answer to PoppyResource.VerifyRequest: who a
+// request from a personal agent is from, or the refusal to send back.
+//
+// Active tells the two apart. A verified result (Active true) carries
+// ClientID, UserID, Session and, for a signed-in request, Account. A
+// refusal (Active false) carries Error and Response; send Response to the
+// personal agent unchanged with WritePoppyRefusal.
+type PoppyVerification struct {
+	// Active is true when LumoAuth verified the request.
+	Active bool `json:"active"`
+
+	// ClientID is the personal agent: the URL of its metadata document.
+	// LumoAuth checked this value.
+	ClientID string `json:"client_id,omitempty"`
+	// ClientName is the name that the personal agent gives itself.
+	ClientName string `json:"client_name,omitempty"`
+	// UserID is the personal agent's stable name for its user at your
+	// organization. It is not an account: never look an account up by it.
+	UserID string `json:"user_id,omitempty"`
+	// AgentID is set when the personal agent runs several agents for one
+	// user and says which one this is. Empty otherwise.
+	AgentID string `json:"agent_id,omitempty"`
+	// Session is the Session of the request. Nil in a refusal.
+	Session *PoppySession `json:"session,omitempty"`
+	// SignedIn is true when the request carried a valid access token.
+	SignedIn bool `json:"signed_in"`
+	// Account says whose access token the request carried. Nil when the
+	// request is signed out.
+	Account *PoppyAccount `json:"account,omitempty"`
+	// Version is the Poppy-Version of the request.
+	Version string `json:"version,omitempty"`
+	// Extensions are the extensions that the request declares, as name and
+	// version.
+	Extensions map[string]string `json:"extensions,omitempty"`
+
+	// Error is the protocol's error code of a refusal, such as
+	// "invalid_session" or "insufficient_scope".
+	Error string `json:"error,omitempty"`
+	// ErrorDescription explains a refusal.
+	ErrorDescription string `json:"error_description,omitempty"`
+	// Scope holds the scopes that a refusal asks for, space-separated.
+	// Empty when the refusal names none.
+	Scope string `json:"scope,omitempty"`
+	// Response is the HTTP response that the personal agent must get. Nil
+	// in a verified result.
+	Response *PoppyRelayResponse `json:"response,omitempty"`
+
+	// Raw is the complete decoded answer.
+	Raw map[string]any `json:"-"`
+}
+
+// UnmarshalJSON decodes a verification answer and fails closed: an answer
+// that is neither a complete verified result nor a well-formed refusal is
+// an error, and is never decoded as verified.
+func (v *PoppyVerification) UnmarshalJSON(data []byte) error {
+	parsed, err := parsePoppyVerification(data)
+	if err != nil {
+		return err
+	}
+	*v = *parsed
+	return nil
+}
+
+// PoppySession is the Session of a verified request.
+type PoppySession struct {
+	// ID is LumoAuth's id of the Session. Store your own Session state
+	// under it, such as a cart.
+	ID int64 `json:"id"`
+	// SID is the Session ID that the personal agent chose. GetSessionStatus
+	// and EndSession take it.
+	SID string `json:"sid"`
+	// IsNew is true when this request started the Session.
+	IsNew bool `json:"new"`
+	// StartedAt is the start of the Session, as an RFC 3339 time.
+	StartedAt string `json:"started_at,omitempty"`
+}
+
+// PoppyAccount describes the access token of a signed-in request.
+type PoppyAccount struct {
+	// Subject is the id of the user in your LumoAuth organization. Use it
+	// to find the account's data.
+	Subject string `json:"sub"`
+	// Scope is the space-separated scope string of the access token; see
+	// Scopes and HasScope.
+	Scope string `json:"scope"`
+	// Audience lists the services that the access token is for.
+	Audience []string `json:"aud"`
+	// Expires is the expiry of the access token in Unix seconds, or 0 when
+	// LumoAuth sent none.
+	Expires int64 `json:"exp"`
+	// TokenType is "DPoP" for a token bound to a DPoP key, "Bearer"
+	// otherwise.
+	TokenType string `json:"token_type,omitempty"`
+}
+
+// Scopes returns the access token's scopes as a slice.
+func (a *PoppyAccount) Scopes() []string {
+	if a == nil {
+		return nil
+	}
+	return splitScopes(a.Scope)
+}
+
+// HasScope reports whether the access token carries the scope.
+func (a *PoppyAccount) HasScope(scope string) bool {
+	for _, s := range a.Scopes() {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// PoppyRelayResponse is the HTTP response that a refused personal agent
+// must get: the status, the headers and the body, exactly as LumoAuth
+// worded them.
+type PoppyRelayResponse struct {
+	Status  int               `json:"status"`
+	Headers map[string]string `json:"headers"`
+	// Body is the JSON object to send, or nil when the response has no
+	// body. Access token errors travel in WWW-Authenticate and have none.
+	Body map[string]any `json:"body"`
+}
+
+// Session states that PoppySessionStatus.Status reports.
+const (
+	PoppyStatusActive = "active"
+	PoppyStatusEnded  = "ended"
+	// PoppyStatusUnknown means that no Session has the sid: it never
+	// started, or nothing used it for the idle period.
+	PoppyStatusUnknown = "unknown"
+)
+
+// PoppySessionStatus is the answer to PoppyResource.GetSessionStatus.
+type PoppySessionStatus struct {
+	// Status is PoppyStatusActive, PoppyStatusEnded or PoppyStatusUnknown.
+	Status string `json:"status"`
+	// UserID is the personal agent's name for its user. Empty for an
+	// unknown Session.
+	UserID string `json:"user_id,omitempty"`
+	// AgentID is set when the personal agent named one of several agents.
+	AgentID string `json:"agent_id,omitempty"`
+	// Account is the id of the account that the Session used, or "".
+	Account string `json:"account,omitempty"`
+	// SignedIn is true while the Session is active, it used an account,
+	// and the personal agent still holds a valid refresh token for it.
+	SignedIn bool `json:"signed_in"`
+	// LastSeenAt is the time of the Session's last request, as an RFC 3339
+	// time. Empty for an unknown Session.
+	LastSeenAt string `json:"last_seen_at,omitempty"`
+
+	// Raw is the complete decoded answer.
+	Raw map[string]any `json:"-"`
+}
+
+// Active reports whether the Session still stands.
+func (s *PoppySessionStatus) Active() bool { return s != nil && s.Status == PoppyStatusActive }
+
+// UnmarshalJSON decodes a Session status and refuses an answer without a
+// status or with a member of the wrong type.
+func (s *PoppySessionStatus) UnmarshalJSON(data []byte) error {
+	parsed, err := parsePoppySessionStatus(data)
+	if err != nil {
+		return err
+	}
+	*s = *parsed
+	return nil
+}

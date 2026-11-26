@@ -25,9 +25,15 @@ type WebConfig struct {
 	// BaseURL is the LumoAuth deployment, e.g. "https://app.lumoauth.dev".
 	// Defaults to $LUMOAUTH_URL, then DefaultBaseURL.
 	BaseURL string
-	// Organization is the tenant slug that owns the OAuth client.
-	// Defaults to $LUMOAUTH_ORG_ID.
+	// Organization is the slug of the organization that owns the OAuth
+	// client. Defaults to $LUMOAUTH_ORG_ID. Required unless CustomDomain is
+	// set.
 	Organization string
+	// CustomDomain addresses the organization on its own domain, for
+	// example "auth.acme.com". Defaults to $LUMOAUTH_CUSTOM_DOMAIN. It wins
+	// over BaseURL: the sign-in, token and UserInfo addresses are then on
+	// that domain, without the /orgs/{orgId} segment. See WithCustomDomain.
+	CustomDomain string
 	// ClientID is the OAuth client registered for this app. Required.
 	ClientID string
 	// ClientSecret is required for confidential clients; omit for public
@@ -109,9 +115,18 @@ func NewWebAuth(cfg WebConfig) (*WebAuth, error) {
 	cfg.BaseURL = strings.TrimRight(
 		firstNonEmpty(cfg.BaseURL, os.Getenv(EnvBaseURL), DefaultBaseURL), "/")
 	cfg.Organization = firstNonEmpty(cfg.Organization, os.Getenv(EnvOrgID))
+	customDomain, err := customDomainFrom(cfg.CustomDomain)
+	if err != nil {
+		return nil, err
+	}
+	cfg.CustomDomain = customDomain
+	if customDomain != "" {
+		// The custom domain wins: the base URL is not used for any request.
+		cfg.BaseURL = customDomain
+	}
 
-	if cfg.Organization == "" {
-		return nil, NewConfigError("Organization is required (or set LUMOAUTH_ORG_ID)")
+	if cfg.Organization == "" && customDomain == "" {
+		return nil, NewConfigError("Organization is required (or set LUMOAUTH_ORG_ID), unless CustomDomain is set")
 	}
 	if cfg.ClientID == "" {
 		return nil, NewConfigError("ClientID is required")
@@ -159,7 +174,10 @@ func NewWebAuth(cfg WebConfig) (*WebAuth, error) {
 
 	client := newClient(&clientConfig{
 		baseURL:            cfg.BaseURL,
+		customDomain:       cfg.CustomDomain,
 		orgID:              cfg.Organization,
+		clientID:           cfg.ClientID,
+		clientSecret:       cfg.ClientSecret,
 		httpClient:         cfg.HTTPClient,
 		skipCertValidation: cfg.SkipCertValidation,
 		userAgent:          userAgent(),
@@ -170,7 +188,8 @@ func NewWebAuth(cfg WebConfig) (*WebAuth, error) {
 
 // Client returns a LumoAuth client bound to this deployment and org, for
 // calls made outside the sign-in flow. It carries no user credentials —
-// use ClientForRequest for those.
+// use ClientForRequest for those. Its Poppy namespace authenticates with
+// the ClientID and ClientSecret of this WebConfig.
 func (w *WebAuth) Client() *Client { return w.client }
 
 // ClientForRequest returns a client authenticated as the signed-in user of
@@ -196,6 +215,7 @@ func (w *WebAuth) ClientForRequest(req *http.Request) (*Client, error) {
 	accessToken := tokens.AccessToken
 	return newClient(&clientConfig{
 		baseURL:            w.cfg.BaseURL,
+		customDomain:       w.cfg.CustomDomain,
 		orgID:              w.cfg.Organization,
 		tokenProvider:      func(context.Context) (string, error) { return accessToken, nil },
 		httpClient:         w.cfg.HTTPClient,

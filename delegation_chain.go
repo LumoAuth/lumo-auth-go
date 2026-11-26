@@ -10,6 +10,9 @@ import (
 // ConfidentialClient is what DelegationChain needs from an agent: a token
 // source plus the OAuth client credentials the consent-code exchange and
 // revocation require. *Agent satisfies it.
+//
+// As for a TokenSource, an implementation that addresses its organization
+// on a custom domain also has the method CustomDomain() string.
 type ConfidentialClient interface {
 	TokenSource
 	ClientID() string
@@ -75,10 +78,16 @@ func NewDelegationChain(agent ConfidentialClient, redirectURI string) *Delegatio
 		userTokens:      map[string]*userTokens{},
 		delegatedTokens: map[string]string{},
 	}
+	// NewDelegationChain returns no error, so an invalid custom domain of
+	// the agent is kept and returned by the first call that needs an
+	// address. *Agent never has one: NewAgent refuses it.
+	customDomain, configErr := customDomainOf(agent)
 	chain.client = newClient(&clientConfig{
-		baseURL:   agent.BaseURL(),
-		orgID:     agent.OrgID(),
-		userAgent: userAgent(),
+		baseURL:      agent.BaseURL(),
+		customDomain: customDomain,
+		configErr:    configErr,
+		orgID:        agent.OrgID(),
+		userAgent:    userAgent(),
 	})
 	chain.resource = chain.client.Delegation
 	return chain

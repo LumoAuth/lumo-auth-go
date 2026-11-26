@@ -29,6 +29,26 @@ func ExampleNew() {
 	fmt.Println(allowed)
 }
 
+// An organization on its own domain: no organization ID, and no path with
+// an /orgs/ segment.
+func ExampleWithCustomDomain() {
+	client, err := lumoauth.New(
+		lumoauth.WithCustomDomain("auth.acme.com"),
+		lumoauth.WithAPIKey("lmk_example"),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	issuer, _ := client.Issuer()
+	adminUsers, _ := client.OrgPath("/admin/users")
+	fmt.Println(issuer)
+	fmt.Println(client.BaseURL() + adminUsers)
+	// Output:
+	// https://auth.acme.com
+	// https://auth.acme.com/api/v1/admin/users
+}
+
 // Relationship-based checks read as questions about a tuple.
 func ExampleZanzibarResource_Check() {
 	client, _ := lumoauth.New(
@@ -244,6 +264,69 @@ func ExampleNewWebAuth() {
 	mux.Handle("/", auth.Middleware(auth.RequireAuth(dashboard)))
 
 	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+
+// An API that personal agents call: the middleware asks LumoAuth to verify
+// each request before the handler runs.
+func ExamplePoppyResource_Middleware() {
+	client, err := lumoauth.New(
+		lumoauth.WithOrgID("acme-corp"),
+		// A confidential application whose allowed scopes include poppy:verify.
+		lumoauth.WithClientCredentials(os.Getenv("SHOP_API_CLIENT_ID"), os.Getenv("SHOP_API_CLIENT_SECRET")),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	verified, err := client.Poppy.Middleware(lumoauth.PoppyMiddlewareOptions{
+		PublicOrigin:  os.Getenv("PUBLIC_ORIGIN"), // for example https://shop.example.com
+		RequiredScope: []string{"orders:read"},
+		OnError: func(w http.ResponseWriter, r *http.Request, err error) {
+			// The error is about this service. Log it, and never send it.
+			log.Printf("Session verification failed: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	orders := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		who, _ := lumoauth.PoppyFromContext(r.Context())
+		fmt.Fprintf(w, "orders of account %s, asked by %s", who.Account.Subject, who.ClientID)
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/orders", verified(orders))
+
+	log.Fatal(http.ListenAndServe(":8787", mux))
+}
+
+// Without the middleware: verify a request in a handler and relay a refusal.
+func ExamplePoppyResource_VerifyHTTPRequest() {
+	client, err := lumoauth.New(
+		lumoauth.WithOrgID("acme-corp"),
+		lumoauth.WithClientCredentials(os.Getenv("SHOP_API_CLIENT_ID"), os.Getenv("SHOP_API_CLIENT_SECRET")),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	publicOrigin := os.Getenv("PUBLIC_ORIGIN")
+
+	http.HandleFunc("POST /api/orders/{id}/return", func(w http.ResponseWriter, r *http.Request) {
+		verification, err := client.Poppy.VerifyHTTPRequest(r.Context(), publicOrigin, r,
+			&lumoauth.PoppyVerifyOptions{RequiredScope: []string{"orders:write"}})
+		if err != nil {
+			log.Printf("Session verification failed: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if !verification.Active {
+			_ = lumoauth.WritePoppyRefusal(w, verification)
+			return
+		}
+		fmt.Fprintf(w, "order %s returned for account %s", r.PathValue("id"), verification.Account.Subject)
+	})
 }
 
 // An AAuth agent signs its requests with its own key.

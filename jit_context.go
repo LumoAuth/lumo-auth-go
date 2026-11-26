@@ -17,6 +17,12 @@ const (
 // TokenSource is the minimal contract JITContext needs: where the instance
 // lives, which org it belongs to, and a bearer token that stays fresh.
 // *Agent satisfies it.
+//
+// A source that addresses its organization on a custom domain also has the
+// method CustomDomain() string, as *Agent does. JITContext then sends its
+// requests to that domain without the /orgs/{orgId} segment. Without that
+// method the paths are in the platform form, which a custom domain answers
+// with 404.
 type TokenSource interface {
 	BaseURL() string
 	OrgID() string
@@ -78,8 +84,13 @@ func NewJITContext(source TokenSource, opts ...JITContextOption) (*JITContext, e
 		opt(jit)
 	}
 
+	customDomain, err := customDomainOf(source)
+	if err != nil {
+		return nil, err
+	}
 	jit.client = newClient(&clientConfig{
 		baseURL:       source.BaseURL(),
+		customDomain:  customDomain,
 		orgID:         source.OrgID(),
 		tokenProvider: jit.bearer,
 		userAgent:     userAgent(),

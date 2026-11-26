@@ -26,8 +26,14 @@ type AgentConfig struct {
 	// BaseURL is the LumoAuth instance. Defaults to $LUMOAUTH_URL, then
 	// DefaultBaseURL.
 	BaseURL string
-	// OrgID is the organization slug. Defaults to $LUMOAUTH_ORG_ID.
+	// OrgID is the organization slug. Defaults to $LUMOAUTH_ORG_ID. Not
+	// needed with CustomDomain.
 	OrgID string
+	// CustomDomain addresses the organization on its own domain, for
+	// example "auth.acme.com". Defaults to $LUMOAUTH_CUSTOM_DOMAIN. It wins
+	// over BaseURL, no path then carries the /orgs/{orgId} segment, and the
+	// issuer is the bare domain. See WithCustomDomain.
+	CustomDomain string
 	// ClientID is the agent's OAuth client. Defaults to $AGENT_CLIENT_ID.
 	ClientID string
 	// ClientSecret is the agent's OAuth secret. Defaults to
@@ -50,7 +56,8 @@ type AgentConfig struct {
 	// in $AGENT_PRIVATE_KEY, with its kid from $AGENT_KEY_ID.
 	PrivateKey *ClientAssertionSigner
 	// Issuer is the organization's issuer identifier, the assertion's aud.
-	// Defaults to IssuerFor(BaseURL, OrgID); set it on a custom domain.
+	// Defaults to the custom domain when CustomDomain is set, and to
+	// IssuerFor(BaseURL, OrgID) otherwise.
 	Issuer string
 	// DPoP binds the agent's tokens to a key (RFC 9449). The client
 	// credentials grant, MCP token exchanges and delegation exchanges then
@@ -100,6 +107,7 @@ type Agent struct {
 	Permissions *PermissionsResource
 
 	baseURL      string
+	customDomain string
 	orgID        string
 	clientID     string
 	clientSecret string
@@ -137,6 +145,15 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 		issuer:       cfg.Issuer,
 	}
 	agent.baseURL = strings.TrimRight(agent.baseURL, "/")
+	customDomain, err := customDomainFrom(cfg.CustomDomain)
+	if err != nil {
+		return nil, err
+	}
+	if customDomain != "" {
+		// The custom domain wins: the base URL is not used for any request.
+		agent.customDomain = customDomain
+		agent.baseURL = customDomain
+	}
 
 	if agent.assertion == nil && os.Getenv(EnvAgentPrivateKey) != "" {
 		signer, err := LoadClientAssertionSigner(os.Getenv(EnvAgentPrivateKey), ClientAssertionOptions{KeyID: os.Getenv(EnvAgentKeyID)})
@@ -163,8 +180,11 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 
 	agent.client = newClient(&clientConfig{
 		baseURL:            agent.baseURL,
+		customDomain:       agent.customDomain,
 		orgID:              agent.orgID,
 		tokenProvider:      agent.AccessToken,
+		clientID:           agent.clientID,
+		clientSecret:       agent.clientSecret,
 		timeout:            cfg.Timeout,
 		httpClient:         cfg.HTTPClient,
 		skipCertValidation: cfg.SkipCertValidation,
@@ -186,11 +206,17 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 // escape hatch.
 func (a *Agent) Client() *Client { return a.client }
 
-// BaseURL returns the LumoAuth instance URL.
+// BaseURL returns the address that the agent sends its requests to: the
+// custom domain when one is set, the LumoAuth instance URL otherwise.
 func (a *Agent) BaseURL() string { return a.baseURL }
 
 // OrgID returns the organization slug.
 func (a *Agent) OrgID() string { return a.orgID }
+
+// CustomDomain returns the organization's custom domain as an origin, or
+// "" when none is set. NewJITContext and NewDelegationChain read it, so
+// their requests follow the agent's own addressing.
+func (a *Agent) CustomDomain() string { return a.customDomain }
 
 // ClientID returns the agent's OAuth client ID.
 func (a *Agent) ClientID() string { return a.clientID }
@@ -248,18 +274,25 @@ func (a *Agent) Authenticate(ctx context.Context, scopes ...string) (string, err
 }
 
 // ClientAssertion signs a new private_key_jwt client assertion for this agent
-// (single-use), addressed to AgentConfig.Issuer or IssuerFor(BaseURL, OrgID).
-// It is a *ConfigError when the agent has no PrivateKey.
+// (single-use), addressed to AgentConfig.Issuer, else to the custom domain,
+// else to IssuerFor(BaseURL, OrgID). It is a *ConfigError when the agent has
+// no PrivateKey.
 func (a *Agent) ClientAssertion() (string, error) {
 	if a.assertion == nil {
 		return "", NewConfigError("this agent signs no client assertions: set AgentConfig.PrivateKey")
 	}
 	audience := a.issuer
 	if audience == "" {
-		if a.orgID == "" {
-			return "", NewConfigError("OrgID (LUMOAUTH_ORG_ID) or Issuer is needed to address a client assertion")
+		// The issuer of the organization: the bare custom domain, or the
+		// platform form, which needs the organization ID.
+		switch {
+		case a.customDomain != "":
+			audience = a.customDomain
+		case a.orgID == "":
+			return "", NewConfigError("OrgID (LUMOAUTH_ORG_ID), CustomDomain or Issuer is needed to address a client assertion")
+		default:
+			audience = IssuerFor(a.baseURL, a.orgID)
 		}
-		audience = IssuerFor(a.baseURL, a.orgID)
 	}
 	return a.assertion.Assertion(a.clientID, audience)
 }

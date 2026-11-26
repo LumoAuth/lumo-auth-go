@@ -276,8 +276,17 @@ var defaultReplayCache = &MemoryReplayCache{maxSize: 100_000}
 // AccessTokenVerifyOptions configures VerifyAccessToken.
 type AccessTokenVerifyOptions struct {
 	// Issuer is the organization's issuer URL, e.g.
-	// "https://app.lumoauth.dev/orgs/acme-corp/api/v1". Required.
+	// "https://app.lumoauth.dev/orgs/acme-corp/api/v1". Required unless
+	// CustomDomain is set.
 	Issuer string
+	// CustomDomain is the organization's custom domain, for example
+	// "auth.acme.com". When it is set, the trusted issuer is the bare
+	// domain ("https://auth.acme.com") and Issuer is not used: a token
+	// that names the platform issuer is refused. The keys are read from
+	// the domain's discovery document. The value follows the rules of
+	// WithCustomDomain; an invalid one is a *ConfigError from
+	// VerifyAccessToken. The environment is not read.
+	CustomDomain string
 	// Resource is this server's resource URI — the value the MCP server is
 	// registered with and the token's `aud` must name. Required.
 	Resource string
@@ -335,8 +344,9 @@ const (
 // Failures are a *ValidationError whose Reason is a TokenRejected*
 // constant. Fetch failures are *NetworkError or *APIError.
 func VerifyAccessToken(ctx context.Context, token string, opts AccessTokenVerifyOptions) (*AccessTokenClaims, error) {
-	if opts.Issuer == "" {
-		return nil, NewConfigError("Issuer is required to verify an access token")
+	issuer, discoveryURL, err := opts.trustedIssuer()
+	if err != nil {
+		return nil, err
 	}
 	if opts.Resource == "" {
 		return nil, NewConfigError("Resource is required to verify an access token")
@@ -347,7 +357,6 @@ func VerifyAccessToken(ctx context.Context, token string, opts AccessTokenVerify
 	} else if skew < 0 {
 		skew = 0
 	}
-	issuer := strings.TrimRight(opts.Issuer, "/")
 
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
@@ -381,7 +390,7 @@ func VerifyAccessToken(ctx context.Context, token string, opts AccessTokenVerify
 		return nil, rejectToken(TokenRejectedIssuer, fmt.Sprintf("untrusted issuer %q", claimsMap["iss"]))
 	}
 
-	jwk, err := accessTokenKey(ctx, kid, issuer, opts)
+	jwk, err := accessTokenKey(ctx, kid, discoveryURL, issuer, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -461,7 +470,7 @@ func accessTokenAlgAllowed(alg string) bool {
 
 // accessTokenKey finds the signing key for kid: in the supplied JWKS, or
 // through a cache with one refetch on an unknown kid.
-func accessTokenKey(ctx context.Context, kid, issuer string, opts AccessTokenVerifyOptions) (*JWK, error) {
+func accessTokenKey(ctx context.Context, kid, discoveryURL, issuer string, opts AccessTokenVerifyOptions) (*JWK, error) {
 	if opts.JWKS != nil {
 		if jwk, found := opts.JWKS.Find(kid); found {
 			return jwk, nil
@@ -471,7 +480,7 @@ func accessTokenKey(ctx context.Context, kid, issuer string, opts AccessTokenVer
 	}
 	cache := opts.KeyCache
 	if cache == nil {
-		cache = sharedAccessTokenKeyCache(issuer, opts.HTTPClient)
+		cache = sharedAccessTokenKeyCache(issuer, discoveryURL, opts.HTTPClient)
 	}
 	keys, err := cache.Get(ctx)
 	if err != nil {
@@ -654,11 +663,53 @@ func jsonInt64(value any) (int64, bool) {
 
 // ── Key discovery ─────────────────────────────────────────────────────
 
+// openIDConfigurationPath is the path of the discovery document below an
+// issuer on the platform host, and below /api/v1 on a custom domain.
+const openIDConfigurationPath = "/.well-known/openid-configuration"
+
+// trustedIssuer returns the issuer that a token must name and the address
+// of that issuer's discovery document. With CustomDomain the issuer is the
+// bare domain and nothing else is accepted.
+func (o AccessTokenVerifyOptions) trustedIssuer() (issuer, discoveryURL string, err error) {
+	customDomain, err := normalizeCustomDomain(o.CustomDomain)
+	if err != nil {
+		return "", "", err
+	}
+	if customDomain != "" {
+		return customDomain, customDomainDiscoveryURL(customDomain), nil
+	}
+	if o.Issuer == "" {
+		return "", "", NewConfigError("Issuer is required to verify an access token (or CustomDomain, for an organization on its own domain)")
+	}
+	issuer = strings.TrimRight(o.Issuer, "/")
+	return issuer, issuer + openIDConfigurationPath, nil
+}
+
+// customDomainDiscoveryURL is the discovery document of a custom domain in
+// its route form: {domain}/api/v1/.well-known/openid-configuration.
+func customDomainDiscoveryURL(customDomain string) string {
+	transport := &httpClient{baseURL: customDomain, customDomain: customDomain}
+	discoveryURL, _ := transport.orgPrefixed(openIDConfigurationPath)
+	return discoveryURL
+}
+
 // FetchAccessTokenJWKS retrieves an organization's token-signing keys: it
 // reads jwks_uri from {issuer}/.well-known/openid-configuration and fetches
 // that document.
+//
+// For an organization on a custom domain, the issuer is the bare domain.
+// NewAccessTokenKeyCacheForCustomDomain and
+// AccessTokenVerifyOptions.CustomDomain read the domain's discovery
+// document at /api/v1/.well-known/openid-configuration.
 func FetchAccessTokenJWKS(ctx context.Context, issuer string, httpClient *http.Client) (*JWKS, error) {
 	issuer = strings.TrimRight(issuer, "/")
+	return fetchAccessTokenJWKS(ctx, issuer, issuer+openIDConfigurationPath, httpClient)
+}
+
+// fetchAccessTokenJWKS reads jwks_uri from the discovery document at
+// discoveryURL and fetches the key set, which must be on the issuer's
+// origin.
+func fetchAccessTokenJWKS(ctx context.Context, issuer, discoveryURL string, httpClient *http.Client) (*JWKS, error) {
 	if _, err := url.ParseRequestURI(issuer); err != nil {
 		return nil, configErrorf("invalid issuer URL %q", issuer)
 	}
@@ -672,7 +723,7 @@ func FetchAccessTokenJWKS(ctx context.Context, issuer string, httpClient *http.C
 		Issuer  string `json:"issuer"`
 		JWKSURI string `json:"jwks_uri"`
 	}
-	if err := transport.do(ctx, http.MethodGet, issuer+"/.well-known/openid-configuration", &request{NoAuth: true}, &discovery); err != nil {
+	if err := transport.do(ctx, http.MethodGet, discoveryURL, &request{NoAuth: true}, &discovery); err != nil {
 		return nil, err
 	}
 	if discovery.JWKSURI == "" {
@@ -708,9 +759,10 @@ func sameOrigin(a, b string) bool {
 // AccessTokenVerifyOptions.KeyCache, or let VerifyAccessToken use its
 // process-wide cache.
 type AccessTokenKeyCache struct {
-	issuer     string
-	ttl        time.Duration
-	httpClient *http.Client
+	issuer       string
+	discoveryURL string
+	ttl          time.Duration
+	httpClient   *http.Client
 
 	mu        sync.Mutex
 	keys      *JWKS
@@ -720,10 +772,30 @@ type AccessTokenKeyCache struct {
 // NewAccessTokenKeyCache builds a cache for one issuer. A ttl of 0 means
 // one hour.
 func NewAccessTokenKeyCache(issuer string, ttl time.Duration, httpClient *http.Client) *AccessTokenKeyCache {
+	issuer = strings.TrimRight(issuer, "/")
+	return newAccessTokenKeyCache(issuer, issuer+openIDConfigurationPath, ttl, httpClient)
+}
+
+// NewAccessTokenKeyCacheForCustomDomain builds a cache for an organization
+// on its custom domain, for example "auth.acme.com". The issuer is the bare
+// domain. It returns a *ConfigError for a value that is empty or not valid
+// (see WithCustomDomain). A ttl of 0 means one hour.
+func NewAccessTokenKeyCacheForCustomDomain(customDomain string, ttl time.Duration, httpClient *http.Client) (*AccessTokenKeyCache, error) {
+	normalized, err := normalizeCustomDomain(customDomain)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == "" {
+		return nil, NewConfigError("a custom domain is required, for example \"auth.acme.com\"")
+	}
+	return newAccessTokenKeyCache(normalized, customDomainDiscoveryURL(normalized), ttl, httpClient), nil
+}
+
+func newAccessTokenKeyCache(issuer, discoveryURL string, ttl time.Duration, httpClient *http.Client) *AccessTokenKeyCache {
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	return &AccessTokenKeyCache{issuer: strings.TrimRight(issuer, "/"), ttl: ttl, httpClient: httpClient}
+	return &AccessTokenKeyCache{issuer: issuer, discoveryURL: discoveryURL, ttl: ttl, httpClient: httpClient}
 }
 
 // Get returns the cached key set, fetching it when absent or stale.
@@ -736,7 +808,7 @@ func (c *AccessTokenKeyCache) Get(ctx context.Context) (*JWKS, error) {
 	}
 	c.mu.Unlock()
 
-	keys, err := FetchAccessTokenJWKS(ctx, c.issuer, c.httpClient)
+	keys, err := fetchAccessTokenJWKS(ctx, c.issuer, c.discoveryURL, c.httpClient)
 	if err != nil {
 		return nil, err
 	}
@@ -761,15 +833,16 @@ var (
 	sharedKeyCaches   = map[string]*AccessTokenKeyCache{}
 )
 
-// sharedAccessTokenKeyCache returns the process-wide cache for an issuer.
-func sharedAccessTokenKeyCache(issuer string, httpClient *http.Client) *AccessTokenKeyCache {
+// sharedAccessTokenKeyCache returns the process-wide cache for an issuer
+// and its discovery document.
+func sharedAccessTokenKeyCache(issuer, discoveryURL string, httpClient *http.Client) *AccessTokenKeyCache {
 	sharedKeyCachesMu.Lock()
 	defer sharedKeyCachesMu.Unlock()
-	if cache, ok := sharedKeyCaches[issuer]; ok {
+	if cache, ok := sharedKeyCaches[discoveryURL]; ok {
 		return cache
 	}
-	cache := NewAccessTokenKeyCache(issuer, 0, httpClient)
-	sharedKeyCaches[issuer] = cache
+	cache := newAccessTokenKeyCache(issuer, discoveryURL, 0, httpClient)
+	sharedKeyCaches[discoveryURL] = cache
 	return cache
 }
 
@@ -813,7 +886,11 @@ func ContextWithAccessToken(ctx context.Context, claims *AccessTokenClaims) cont
 // nil the middleware keeps one key cache for the issuer.
 func RequireAccessToken(opts AccessTokenVerifyOptions) func(http.Handler) http.Handler {
 	if opts.JWKS == nil && opts.KeyCache == nil {
-		opts.KeyCache = NewAccessTokenKeyCache(opts.Issuer, 0, opts.HTTPClient)
+		// A configuration error leaves the cache unset. VerifyAccessToken
+		// then returns that error for each request.
+		if issuer, discoveryURL, err := opts.trustedIssuer(); err == nil {
+			opts.KeyCache = newAccessTokenKeyCache(issuer, discoveryURL, 0, opts.HTTPClient)
+		}
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

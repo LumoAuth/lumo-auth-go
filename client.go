@@ -62,18 +62,29 @@ type Client struct {
 	Approvals *ApprovalsResource
 	// Mcp covers audience-scoped tokens for secured MCP servers.
 	Mcp *McpResource
+	// Poppy covers the Personal Agent Protocol for your own API: it
+	// verifies requests from personal agents, and looks up and ends their
+	// Sessions. It needs WithClientCredentials.
+	Poppy *PoppyResource
 
-	baseURL string
-	orgID   string
-	apiKey  string
-	http    *httpClient
+	baseURL      string
+	customDomain string
+	orgID        string
+	apiKey       string
+	http         *httpClient
 }
 
 // Option configures a Client. Options are applied in order.
 type Option func(*clientConfig)
 
 type clientConfig struct {
-	baseURL            string
+	baseURL string
+	// customDomain is the raw option value in New, and the normalized
+	// origin once a constructor has resolved it (see customDomainFrom).
+	customDomain string
+	// configErr is a configuration error that the constructor could not
+	// return. Every request and every address of the client returns it.
+	configErr          error
 	orgID              string
 	apiKey             string
 	tokenProvider      TokenProvider
@@ -83,6 +94,8 @@ type clientConfig struct {
 	headers            map[string]string
 	userAgent          string
 	dpop               *DPoPSigner
+	clientID           string
+	clientSecret       string
 }
 
 // WithBaseURL sets the LumoAuth instance URL. Defaults to $LUMOAUTH_URL,
@@ -92,9 +105,27 @@ func WithBaseURL(baseURL string) Option {
 }
 
 // WithOrgID sets the organization slug. Required for org-scoped endpoints
-// (ABAC, agents, JIT, approvals, OAuth). Defaults to $LUMOAUTH_ORG_ID.
+// (ABAC, agents, JIT, approvals, OAuth) on the platform host. Defaults to
+// $LUMOAUTH_ORG_ID. A client with a custom domain does not need it.
 func WithOrgID(orgID string) Option {
 	return func(c *clientConfig) { c.orgID = orgID }
+}
+
+// WithCustomDomain addresses the organization on its own domain, for
+// example "auth.acme.com" or "https://auth.acme.com". Defaults to
+// $LUMOAUTH_CUSTOM_DOMAIN.
+//
+// With a custom domain the client sends every request to that domain, and
+// no path carries the /orgs/{orgId} segment. The organization ID is not
+// needed, and the issuer is the bare domain. A custom domain wins over
+// WithBaseURL and $LUMOAUTH_URL: the base URL is then not used at all.
+//
+// The value is a host name or an https:// origin. http:// is accepted only
+// for localhost, 127.0.0.1 and [::1]. New returns a *ConfigError for a
+// value with a path, a query, a fragment or credentials. An empty value
+// means "not set".
+func WithCustomDomain(domain string) Option {
+	return func(c *clientConfig) { c.customDomain = domain }
 }
 
 // WithAPIKey authenticates with a tenant API key, sent as X-API-Key.
@@ -114,6 +145,21 @@ func WithAccessToken(token string) Option {
 // token takes precedence over an API key.
 func WithTokenProvider(provider TokenProvider) Option {
 	return func(c *clientConfig) { c.tokenProvider = provider }
+}
+
+// WithClientCredentials sets the client ID and the client secret of a
+// confidential application of the organization. Only client.Poppy uses
+// them: its calls authenticate with HTTP Basic, and they never send the
+// client's bearer token or API key. The application's allowed scopes must
+// include poppy:verify.
+//
+// A client with these credentials and no other credential can call
+// client.Poppy only.
+func WithClientCredentials(clientID, clientSecret string) Option {
+	return func(c *clientConfig) {
+		c.clientID = clientID
+		c.clientSecret = clientSecret
+	}
 }
 
 // WithTimeout sets the per-request timeout. Default: 30s.
@@ -158,7 +204,8 @@ func WithUserAgent(userAgent string) Option {
 }
 
 // New builds a Client. It returns a *ConfigError when no credential is
-// configured — either an API key or a token provider is required.
+// configured: an API key, a token provider, or the client credentials of
+// WithClientCredentials.
 func New(opts ...Option) (*Client, error) {
 	cfg := &clientConfig{
 		baseURL:   os.Getenv(EnvBaseURL),
@@ -173,10 +220,19 @@ func New(opts ...Option) (*Client, error) {
 	if cfg.baseURL == "" {
 		cfg.baseURL = DefaultBaseURL
 	}
-	if cfg.apiKey == "" && cfg.tokenProvider == nil {
+	customDomain, err := customDomainFrom(cfg.customDomain)
+	if err != nil {
+		return nil, err
+	}
+	cfg.customDomain = customDomain
+	if (cfg.clientID == "") != (cfg.clientSecret == "") {
+		return nil, NewConfigError(
+			"WithClientCredentials needs both values: the client ID and the client secret")
+	}
+	if cfg.apiKey == "" && cfg.tokenProvider == nil && cfg.clientID == "" {
 		return nil, NewConfigError(
 			"a credential is required: pass WithAPIKey (or set LUMOAUTH_API_KEY), " +
-				"WithAccessToken, or WithTokenProvider")
+				"WithAccessToken, WithTokenProvider, or WithClientCredentials")
 	}
 	return newClient(cfg), nil
 }
@@ -186,7 +242,14 @@ func New(opts ...Option) (*Client, error) {
 // credential check, since they authenticate through a token provider they
 // install themselves.
 func newClient(cfg *clientConfig) *Client {
-	transport := newHTTPClient(cfg.baseURL)
+	baseURL := cfg.baseURL
+	if cfg.customDomain != "" {
+		// The custom domain wins: the base URL is not used for any request.
+		baseURL = cfg.customDomain
+	}
+	transport := newHTTPClient(baseURL)
+	transport.customDomain = cfg.customDomain
+	transport.configErr = cfg.configErr
 	transport.orgID = cfg.orgID
 	transport.apiKey = cfg.apiKey
 	transport.tokenProvider = cfg.tokenProvider
@@ -208,10 +271,11 @@ func newClient(cfg *clientConfig) *Client {
 	}
 
 	client := &Client{
-		baseURL: strings.TrimRight(cfg.baseURL, "/"),
-		orgID:   cfg.orgID,
-		apiKey:  cfg.apiKey,
-		http:    transport,
+		baseURL:      strings.TrimRight(baseURL, "/"),
+		customDomain: cfg.customDomain,
+		orgID:        cfg.orgID,
+		apiKey:       cfg.apiKey,
+		http:         transport,
 	}
 	client.Auth = &AuthResource{http: transport}
 	client.Permissions = &PermissionsResource{http: transport}
@@ -222,15 +286,28 @@ func newClient(cfg *clientConfig) *Client {
 	client.Jit = &JitResource{http: transport}
 	client.Approvals = &ApprovalsResource{http: transport}
 	client.Mcp = &McpResource{http: transport, auth: client.Auth}
+	client.Poppy = &PoppyResource{http: transport, clientID: cfg.clientID, clientSecret: cfg.clientSecret}
 	return client
 }
 
-// BaseURL returns the configured LumoAuth instance URL, without a trailing
-// slash.
+// BaseURL returns the address that the client sends its requests to,
+// without a trailing slash: the custom domain when one is set, the
+// LumoAuth instance URL otherwise.
 func (c *Client) BaseURL() string { return c.baseURL }
 
 // OrgID returns the configured organization slug ("" when unset).
 func (c *Client) OrgID() string { return c.orgID }
+
+// CustomDomain returns the organization's custom domain as an origin, for
+// example "https://auth.acme.com", or "" when none is set.
+func (c *Client) CustomDomain() string { return c.customDomain }
+
+// Issuer returns the issuer identifier of the organization: the `iss` of
+// its tokens and the audience of a client assertion. On a custom domain it
+// is the bare domain. On the platform host it is
+// {baseURL}/orgs/{orgID}/api/v1, and a client without an organization ID
+// gets a *ConfigError.
+func (c *Client) Issuer() (string, error) { return c.http.issuer() }
 
 // DPoP returns the signer passed with WithDPoP, or nil.
 func (c *Client) DPoP() *DPoPSigner { return c.http.dpop }
@@ -241,6 +318,12 @@ func (c *Client) DPoP() *DPoPSigner { return c.http.dpop }
 // the JSON response into out (pass nil to discard it). The path is joined
 // to the client's base URL; an absolute URL is used as-is. Non-2xx
 // responses become the typed errors in errors.go.
+//
+// On a custom domain, give the path without the /orgs/{orgId} segment, or
+// build it with OrgPath. A path that starts with the segment of the
+// client's own organization still works when the client has that
+// organization ID: the segment is removed. A path of another organization
+// is sent as it is.
 //
 // Reach for this when an endpoint has no curated namespace yet:
 //
@@ -263,6 +346,9 @@ func (c *Client) DoRaw(ctx context.Context, method, path string, body any) (*htt
 // callers building requests by hand do not hardcode the layout:
 //
 //	path, err := client.OrgPath("/admin/users") // /orgs/acme-corp/api/v1/admin/users
+//
+// On a custom domain the result is /api/v1/admin/users, and no organization
+// ID is needed.
 func (c *Client) OrgPath(path string) (string, error) { return c.http.orgPath(path) }
 
 // APIConfig carries everything needed to point the generated OpenAPI
@@ -298,6 +384,14 @@ type APIConfig struct {
 //
 // The context resolves the current bearer token, so call this once per
 // token lifetime (or per request when using short-lived agent tokens).
+//
+// On a custom domain BaseURL is the domain. The generated client puts
+// /orgs/{orgId} in every path, and a custom domain answers 404 for those.
+// When the client has an organization ID (WithOrgID), HTTPClient is a copy
+// whose transport removes the segment of that organization from requests
+// to the custom domain, so pass the same ID to the generated client's
+// calls. Without an organization ID the generated client cannot reach a
+// custom domain.
 func (c *Client) APIConfig(ctx context.Context) (*APIConfig, error) {
 	headers := map[string]string{}
 	token, err := c.http.bearerToken(ctx)
@@ -322,6 +416,6 @@ func (c *Client) APIConfig(ctx context.Context) (*APIConfig, error) {
 	return &APIConfig{
 		BaseURL:       c.baseURL,
 		DefaultHeader: headers,
-		HTTPClient:    c.http.doer,
+		HTTPClient:    c.http.generatedClientHTTP(),
 	}, nil
 }

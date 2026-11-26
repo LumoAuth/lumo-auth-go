@@ -11,6 +11,7 @@ identity. It covers the following:
   and MCP tokens.
 - AAuth, the protocol for cryptographic agent identity, with RFC 9421 request signing.
 - Verification of AAuth tokens on your own resource server.
+- Verification of requests that personal agents send to your API (Personal Agent Protocol).
 
 The SDK has the same namespaces and the same error codes as the [JS](../sdk-js) and
 [Python](../sdk-python) SDKs. Its RFC 9421 signatures match theirs byte for byte.
@@ -21,6 +22,7 @@ The SDK has the same namespaces and the same error codes as the [JS](../sdk-js) 
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Core concepts](#core-concepts)
+  - [Use a custom domain](#use-a-custom-domain)
 - [Configuration](#configuration)
 - [Guides](#guides)
   - [Check permissions](#check-permissions)
@@ -37,6 +39,7 @@ The SDK has the same namespaces and the same error codes as the [JS](../sdk-js) 
   - [Bind tokens to a key with DPoP](#bind-tokens-to-a-key-with-dpop)
   - [Verify LumoAuth tokens in your MCP server](#verify-lumoauth-tokens-in-your-mcp-server)
   - [Check access to an MCP tool](#check-access-to-an-mcp-tool)
+  - [Verify requests from personal agents](#verify-requests-from-personal-agents)
   - [AAuth: cryptographic agent identity](#aauth-cryptographic-agent-identity)
   - [Verify AAuth tokens on a resource server](#verify-aauth-tokens-on-a-resource-server)
   - [Call any other endpoint](#call-any-other-endpoint)
@@ -118,8 +121,8 @@ if err != nil {
 fmt.Println("may read doc_99:", allowed)
 ```
 
-`NewAgent` reads `LUMOAUTH_URL`, `LUMOAUTH_ORG_ID`, `AGENT_CLIENT_ID` and
-`AGENT_CLIENT_SECRET`. The agent gets its token on the first call and renews it before it
+`NewAgent` reads `LUMOAUTH_URL`, `LUMOAUTH_ORG_ID`, `LUMOAUTH_CUSTOM_DOMAIN`,
+`AGENT_CLIENT_ID` and `AGENT_CLIENT_SECRET`. The agent gets its token on the first call and renews it before it
 expires.
 
 ## Core concepts
@@ -133,6 +136,124 @@ Calls that need an organization return a `ConfigError` when it is missing.
 The **base URL** is the LumoAuth instance. It defaults to `https://app.lumoauth.dev`. Set
 `https://eu.app.lumoauth.dev` when your organization is in the EU region.
 
+An organization that serves LumoAuth on its own domain needs neither of the two. See
+[Use a custom domain](#use-a-custom-domain).
+
+### Use a custom domain
+
+An organization can serve LumoAuth on its own domain, for example `https://auth.acme.com`.
+Pass that domain with `WithCustomDomain`, or set `LUMOAUTH_CUSTOM_DOMAIN`. This program is
+complete:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "os"
+
+    lumoauth "github.com/lumoauth/lumo-auth-go"
+)
+
+func main() {
+    client, err := lumoauth.New(
+        lumoauth.WithCustomDomain("auth.acme.com"), // or "https://auth.acme.com"
+        lumoauth.WithAccessToken(os.Getenv("USER_ACCESS_TOKEN")),
+    )
+    if err != nil {
+        log.Fatal(err) // a ConfigError when the value is not a valid domain
+    }
+
+    // POST https://auth.acme.com/api/v1/abac/check
+    decision, err := client.Abac.Check(context.Background(), lumoauth.AbacCheckParams{
+        ResourceType: "document",
+        Action:       "read",
+        ResourceID:   "doc-123",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    issuer, _ := client.Issuer() // https://auth.acme.com
+    fmt.Println(decision.Allowed, issuer)
+}
+```
+
+With a custom domain, three things differ from the platform host:
+
+- **Paths have no `/orgs/...` segment.** The SDK sends every request to the domain. A route
+  without that segment, such as `/api/v1/authz/check`, keeps its path.
+- **The organization ID is not needed.** When you set it too, the SDK never puts it in a
+  path.
+- **The issuer is the bare domain.** It is the `iss` of the organization's OAuth and OpenID
+  Connect tokens, and the audience of a client assertion. `client.Issuer()` returns it.
+  AAuth is the one exception; see [AAuth on a custom domain](#aauth-on-a-custom-domain).
+
+| Address | Platform host | Custom domain |
+| --- | --- | --- |
+| Token endpoint | `https://app.lumoauth.dev/orgs/acme-corp/api/v1/oauth/token` | `https://auth.acme.com/api/v1/oauth/token` |
+| Permission check | `https://app.lumoauth.dev/api/v1/authz/check` | `https://auth.acme.com/api/v1/authz/check` |
+| Issuer | `https://app.lumoauth.dev/orgs/acme-corp/api/v1` | `https://auth.acme.com` |
+
+A custom domain wins over the base URL: `WithBaseURL` and `LUMOAUTH_URL` are then not used
+for any request.
+
+The value is a host name or an `https://` origin. The SDK turns it into
+`https://<host>[:port]` with a lower-case host. `http://` is accepted only for `localhost`,
+`127.0.0.1` and `[::1]`. A value with a path, a query, a fragment or credentials is a
+`ConfigError`, which the constructor returns. An empty value means "not set".
+
+Every constructor and helper that addresses LumoAuth takes the option:
+
+| Where | How you set it |
+| --- | --- |
+| `lumoauth.New` | `WithCustomDomain(domain)`, or `LUMOAUTH_CUSTOM_DOMAIN` |
+| `NewAgent`, `NewWebAuth`, `NewAAuthClient` | The `CustomDomain` field of the config struct, or `LUMOAUTH_CUSTOM_DOMAIN` |
+| `NewJITContext`, `NewDelegationChain` | Nothing: they follow the agent that you pass |
+| `VerifyAccessToken`, `RequireAccessToken` | `AccessTokenVerifyOptions.CustomDomain`, in place of `Issuer` |
+| `VerifyAuthToken` | `VerifyOptions.CustomDomain` |
+| Key caches | `NewAccessTokenKeyCacheForCustomDomain`, `NewJWKSCacheForCustomDomain` |
+
+The two token verifiers do not read the environment variable. With `CustomDomain`,
+`VerifyAccessToken` accepts exactly one issuer, the bare domain. An access token that names
+the platform issuer is refused.
+
+Three details matter when you build requests yourself:
+
+- `client.OrgPath("/admin/users")` returns `/api/v1/admin/users` on a custom domain. Give
+  `Do` and `DoRaw` paths in that form. A path that starts with the `/orgs/...` segment of
+  your own organization also works when the client has the organization ID: the SDK removes
+  the segment. It never
+  changes a path of another organization.
+- The generated OpenAPI client puts `/orgs/{orgId}` in every path. On a custom domain, set
+  `WithOrgID` as well and pass the same ID to the generated client's calls. The HTTP client
+  from `APIConfig` then removes the segment. Without the organization ID, the generated
+  client cannot reach a custom domain.
+- A `TokenSource` of your own that uses a custom domain must have the method
+  `CustomDomain() string`, as `*Agent` has. `NewJITContext` and `NewDelegationChain` read it.
+
+#### AAuth on a custom domain
+
+AAuth does not follow the issuer rule. LumoAuth names the AAuth issuer with the platform
+address on every host, for example `https://app.lumoauth.dev/orgs/acme-corp/api/v1`. AAuth
+tokens carry that value as `iss`, and an agent addresses it as the audience. The SDK
+therefore never derives the AAuth issuer from the custom domain:
+
+- `AAuthClient` sends its requests to the custom domain, without the `/orgs/...` segment,
+  like every other client.
+- `aauth.ResolveIssuer(ctx)` returns the AAuth issuer. With a custom domain it reads the
+  `issuer` member of the issuer metadata document at
+  `https://auth.acme.com/api/v1/.well-known/aauth-issuer`, once. `aauth.Issuer()` makes no
+  request, so it returns an empty string until `ResolveIssuer` has run.
+- `VerifyAuthToken` with `VerifyOptions.CustomDomain` reads the trusted issuer from the same
+  document and keeps it for one hour. It reads the keys from
+  `https://auth.acme.com/api/v1/aauth/jwks.json`. A token that names the bare domain is
+  refused.
+- Set `AAuthConfig.Issuer` or `VerifyOptions.Issuer` to name the AAuth issuer yourself. The
+  SDK then uses that value and does not read the document.
+
 ### Credentials
 
 The SDK sends exactly one credential with each request. Which calls work depends on the kind
@@ -143,9 +264,11 @@ of credential that you use.
 | Organization API key (`lmk_…`) | `WithAPIKey` or `LUMOAUTH_API_KEY` | `X-API-Key` header | The admin API, client registration, and the permission checks (`Permissions.Check*`, `Zanzibar.Check` and `Expand`). Nothing else. |
 | User access token | `WithAccessToken`, `WithTokenProvider`, or `WebAuth.ClientForRequest` | `Authorization: Bearer` | Calls about the signed-in user. Some calls need a scope; see [Scopes](#scopes). |
 | Agent credential | `NewAgent` (client credentials), or an `agk_…` key passed as a bearer token | `Authorization: Bearer` | The agent, approval, JIT and MCP calls, and the permission checks. The agent's capabilities determine what it may do. |
+| Client credentials of a confidential application | `WithClientCredentials` | `Authorization: Basic`, on the `client.Poppy` calls only | The three `client.Poppy` calls. The application's allowed scopes must include `poppy:verify`. See [Verify requests from personal agents](#verify-requests-from-personal-agents). |
 
 When both a token and an API key are configured, the token wins and the API key is not sent.
-The server rejects requests that carry both.
+The server rejects requests that carry both. The `client.Poppy` calls send the client
+credentials and nothing else. No other call sends the client credentials.
 
 ### Scopes
 
@@ -176,19 +299,22 @@ the token lacks a scope, the server answers 403. The error lists the missing sco
 | Option | What it sets | Default |
 | --- | --- | --- |
 | `WithBaseURL(url)` | The LumoAuth instance | `$LUMOAUTH_URL`, then `https://app.lumoauth.dev` |
-| `WithOrgID(slug)` | The organization slug | `$LUMOAUTH_ORG_ID` |
+| `WithOrgID(slug)` | The organization slug. Not needed with a custom domain. | `$LUMOAUTH_ORG_ID` |
+| `WithCustomDomain(domain)` | The organization's own domain, for example `auth.acme.com`. It wins over the base URL. See [Use a custom domain](#use-a-custom-domain). | `$LUMOAUTH_CUSTOM_DOMAIN` |
 | `WithAPIKey(key)` | An organization API key, sent as `X-API-Key` | `$LUMOAUTH_API_KEY` |
 | `WithAccessToken(token)` | A fixed bearer token | none |
 | `WithTokenProvider(fn)` | A function that returns a bearer token for each request; use it for tokens that you refresh | none |
+| `WithClientCredentials(id, secret)` | The client ID and client secret of a confidential application, for `client.Poppy` | none |
 | `WithTimeout(d)` | The timeout of each request | 30 seconds |
 | `WithHTTPClient(c)` | Your own `*http.Client`, for proxies or instrumentation | a new client |
 | `WithHeader(name, value)` | An extra header on every request | none |
-| `WithUserAgent(ua)` | The `User-Agent` header | `lumoauth-go/<version>` |
+| `WithUserAgent(ua)` | The `User-Agent` header | `lumoauth-go/` followed by the SDK's version |
 | `WithSkipCertValidation()` | Turns off TLS verification. Use it for local development only. | off |
 | `WithDPoP(signer)` | Binds every token the client obtains to a DPoP key, and presents bound tokens with the `DPoP` scheme. See [DPoP](#bind-tokens-to-a-key-with-dpop). | off |
 
 `New` returns a `ConfigError` when no credential is configured. It needs an API key, an
-access token or a token provider.
+access token, a token provider or client credentials. A client that has only client
+credentials can call `client.Poppy` and nothing else.
 
 ### Environment variables
 
@@ -196,6 +322,7 @@ access token or a token provider.
 | --- | --- | --- |
 | `LUMOAUTH_URL` | every constructor | The LumoAuth instance |
 | `LUMOAUTH_ORG_ID` | every constructor | The organization slug |
+| `LUMOAUTH_CUSTOM_DOMAIN` | every constructor | The organization's own domain. It wins over `LUMOAUTH_URL`. |
 | `LUMOAUTH_API_KEY` | `New` | The organization API key |
 | `AGENT_CLIENT_ID` | `NewAgent` | The agent's OAuth client ID |
 | `AGENT_CLIENT_SECRET` | `NewAgent` | The agent's OAuth client secret |
@@ -206,10 +333,10 @@ A value that you pass in code always wins over the environment variable.
 
 | Field | Meaning | Default |
 | --- | --- | --- |
-| `BaseURL`, `OrgID` | As above | the environment variables |
+| `BaseURL`, `OrgID`, `CustomDomain` | As above | the environment variables |
 | `ClientID`, `ClientSecret` | The agent's OAuth client | `$AGENT_CLIENT_ID`, `$AGENT_CLIENT_SECRET` |
 | `PrivateKey` | A `*ClientAssertionSigner` for a **Private key JWT** agent: it signs a client assertion instead of sending a secret | the PEM key in `$AGENT_PRIVATE_KEY`, `kid` from `$AGENT_KEY_ID` |
-| `Issuer` | The organization's issuer identifier, the assertion's `aud` | `IssuerFor(BaseURL, OrgID)` |
+| `Issuer` | The organization's issuer identifier, the assertion's `aud` | the custom domain when `CustomDomain` is set, `IssuerFor(BaseURL, OrgID)` otherwise |
 | `Scopes` | Scopes to request when the agent authenticates | the defaults that are registered for the agent |
 | `RedirectURI` | The callback URL of the consent flow for delegation | none |
 | `Timeout`, `HTTPClient`, `SkipCertValidation` | As for `New` | 30 seconds, a new client, off |
@@ -403,7 +530,8 @@ The router handles three paths:
 | Field | Meaning | Default |
 | --- | --- | --- |
 | `BaseURL` | The LumoAuth instance | `$LUMOAUTH_URL`, then `https://app.lumoauth.dev` |
-| `Organization` | The organization slug that owns the OAuth client | `$LUMOAUTH_ORG_ID` |
+| `Organization` | The organization slug that owns the OAuth client. Required unless `CustomDomain` is set. | `$LUMOAUTH_ORG_ID` |
+| `CustomDomain` | The organization's own domain. The sign-in, token and UserInfo addresses are then on that domain. | `$LUMOAUTH_CUSTOM_DOMAIN` |
 | `ClientID` | The OAuth client of your app (required) | none |
 | `ClientSecret` | Required for confidential clients. Public clients use PKCE alone. | none |
 | `SessionSecret` | The key of the cookie store (required). Keep it the same across restarts, or every session ends. | none |
@@ -887,6 +1015,17 @@ or `KeyCache` (`NewAccessTokenKeyCache`) to control the cache. Replayed proofs a
 an in-memory `ReplayCache`; a server with several replicas should pass a shared
 implementation. Local verification does not check revocation.
 
+For an organization on a [custom domain](#use-a-custom-domain), set `CustomDomain` in place
+of `Issuer`. The trusted issuer is then the bare domain, and the SDK reads the keys through
+`https://auth.acme.com/api/v1/.well-known/openid-configuration`:
+
+```go
+protect := lumoauth.RequireAccessToken(lumoauth.AccessTokenVerifyOptions{
+    CustomDomain: "auth.acme.com",
+    Resource:     "https://mcp.example.com/mcp",
+})
+```
+
 `VerifyAuthToken` is the separate verifier for AAuth `auth+jwt` tokens.
 
 ### Check access to an MCP tool
@@ -947,6 +1086,223 @@ tool authorizer, gives `ErrPermissionDenied`. An unknown server gives `ErrNotFou
 SDK checks the arguments before it sends the request. A tool name or server ID must not
 contain `/`, `:`, `#` or `*`, and a tool name has at most 80 characters.
 
+### Verify requests from personal agents
+
+A personal agent acts for one person and calls your API with a `Poppy-Session` header
+(Personal Agent Protocol). `client.Poppy` asks LumoAuth to verify that header. The answer
+names the personal agent, its user and the Session, and it says whose account the access
+token of the request is for.
+
+**Set up the application.** Your API authenticates as one of your organization's
+confidential applications. In LumoAuth, open **Applications** and add the `poppy:verify`
+scope to the allowed scopes of that application. Without the scope, every call fails with
+`ErrPermissionDenied`. Pass the application's client ID and client secret to the client:
+
+```go
+client, err := lumoauth.New(
+    lumoauth.WithOrgID("acme-corp"),
+    lumoauth.WithClientCredentials(os.Getenv("SHOP_API_CLIENT_ID"), os.Getenv("SHOP_API_CLIENT_SECRET")),
+)
+```
+
+The `client.Poppy` calls send these credentials with HTTP Basic. They never send the
+client's API key or bearer token. An app that signs users in with `NewWebAuth` and a
+confidential application can use `auth.Client().Poppy`, which sends the credentials of
+`WebConfig`.
+
+**Protect routes with the middleware.** `client.Poppy.Middleware` verifies each request
+before your handler runs. This program is complete:
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "log"
+    "net/http"
+    "os"
+
+    lumoauth "github.com/lumoauth/lumo-auth-go"
+)
+
+func main() {
+    client, err := lumoauth.New(
+        lumoauth.WithOrgID("acme-corp"),
+        lumoauth.WithClientCredentials(os.Getenv("SHOP_API_CLIENT_ID"), os.Getenv("SHOP_API_CLIENT_SECRET")),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // verified returns the middleware for routes that need the given scopes.
+    verified := func(scopes ...string) func(http.Handler) http.Handler {
+        middleware, err := client.Poppy.Middleware(lumoauth.PoppyMiddlewareOptions{
+            PublicOrigin:  os.Getenv("PUBLIC_ORIGIN"), // for example https://shop.example.com
+            RequiredScope: scopes,
+            OnError: func(w http.ResponseWriter, r *http.Request, err error) {
+                log.Printf("Session verification failed: %v", err)
+                http.Error(w, "internal error", http.StatusInternalServerError)
+            },
+        })
+        if err != nil {
+            log.Fatal(err) // PublicOrigin or the client credentials are missing
+        }
+        return middleware
+    }
+
+    mux := http.NewServeMux()
+    mux.Handle("GET /api/catalog", verified()(http.HandlerFunc(catalog)))
+    mux.Handle("GET /api/orders", verified("orders:read")(http.HandlerFunc(orders)))
+    log.Fatal(http.ListenAndServe(":8787", mux))
+}
+
+// catalog works signed out. Keep signed-out state, such as a cart, under Session.ID.
+func catalog(w http.ResponseWriter, r *http.Request) {
+    who, _ := lumoauth.PoppyFromContext(r.Context())
+    log.Printf("catalog for %s, Session %d", who.ClientID, who.Session.ID)
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]any{"items": []string{"trail-socks-3"}})
+}
+
+// orders needs a scope, so LumoAuth has checked the access token and Account is set.
+func orders(w http.ResponseWriter, r *http.Request) {
+    who, _ := lumoauth.PoppyFromContext(r.Context())
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]any{"account": who.Account.Subject, "orders": []string{}})
+}
+```
+
+For each request, the middleware does one of three things:
+
+- **Verified.** It stores the `*PoppyVerification` in the request context and calls the
+  handler. Read it with `lumoauth.PoppyFromContext(r.Context())`.
+- **Refused.** It sends LumoAuth's response to the personal agent unchanged: the status,
+  every header and the body. It does not call the handler.
+- **The call failed.** The SDK could not reach LumoAuth, or LumoAuth rejected your
+  application (401, 403, 404 or 429). The middleware does not call the handler and relays
+  nothing. It calls `OnError`. Without `OnError` it answers `500` with the fixed body
+  `{"error":"server_error"}`. The error text never reaches the personal agent.
+
+The SDK does not log. Set `OnError` to record the error, as the example does. Never write
+the error to the response: it is about your service, not about the personal agent.
+
+| Field of `PoppyMiddlewareOptions` | Meaning |
+| --- | --- |
+| `PublicOrigin` | The address that personal agents call, for example `https://shop.example.com`. Required. |
+| `RequiredScope` | The scopes that the routes need. Leave it empty for routes that work signed out. |
+| `Resource` | The resource identifier of your service, when it takes only access tokens that were issued for it. |
+| `AllowReplay` | Accepts a Session JWT that was verified before. The default is `false`. |
+| `OnError` | Called when the verification call fails. It must answer the request. |
+
+**Take the public origin from configuration.** The Session JWT names the URL that the
+personal agent called, so LumoAuth must get that same URL. The middleware builds it from
+`PublicOrigin` and the path of the request line (`r.RequestURI`). It drops the query. It
+never reads the `Host` or `X-Forwarded-*` headers, because a caller controls them.
+`PublicOrigin` may carry a base path, such as `https://example.com/shop`, when a proxy
+removes that prefix before the request reaches your server. `http.StripPrefix` or a
+router prefix in front of the middleware does not shorten the URL, so the order of the two
+does not matter. `Middleware` returns a `ConfigError` when `PublicOrigin` is missing or is
+not a valid address.
+
+A Session JWT is good for one verification. Put the middleware on a route once, and pass
+the result inward. Set `AllowReplay` only when one request is verified in several places.
+
+Each request waits for the verification call. The call uses the client's timeout, which is
+30 seconds by default. Set a shorter one with `WithTimeout`.
+
+**Verify a request without the middleware.** Call `VerifyHTTPRequest` in a handler, and
+relay a refusal with `WritePoppyRefusal`:
+
+```go
+func returnOrder(w http.ResponseWriter, r *http.Request) {
+    verification, err := client.Poppy.VerifyHTTPRequest(r.Context(), publicOrigin, r,
+        &lumoauth.PoppyVerifyOptions{RequiredScope: []string{"orders:write"}})
+    if err != nil {
+        log.Printf("Session verification failed: %v", err)
+        http.Error(w, "internal error", http.StatusInternalServerError)
+        return
+    }
+    if !verification.Active {
+        lumoauth.WritePoppyRefusal(w, verification) // LumoAuth's response, unchanged
+        return
+    }
+    // verification.ClientID, verification.Session.ID, verification.Account.Subject
+}
+```
+
+With another router or server, pass the parts of the request to `VerifyRequest`. You can
+pass all the headers of the request. The SDK sends only five of them: `Poppy-Session`,
+`Poppy-Version`, `Poppy-Extensions`, `Authorization` and `DPoP`. A cookie or an API key
+therefore never reaches LumoAuth.
+
+```go
+verification, err := client.Poppy.VerifyRequest(ctx, lumoauth.PoppyRequest{
+    Method:  method,
+    URL:     publicOrigin + path, // the path as the client sent it
+    Headers: headers,
+}, nil)
+```
+
+A refusal is not an error: `Active` is `false`, `Error` holds the protocol's error code and
+`Response` holds the status, headers and body to send. `lumoauth.BuildPoppyVerifyBody`
+builds the request body without a call, for your own transport or tests.
+
+A verified result has these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `ClientID`, `ClientName` | The personal agent. LumoAuth checked `ClientID`. The name is the agent's own claim. |
+| `UserID` | The agent's name for its user at your organization. It is not an account. |
+| `AgentID` | Set when the personal agent runs several agents for one user. |
+| `Session.ID`, `Session.SID`, `Session.IsNew`, `Session.StartedAt` | The Session. `IsNew` is true when this request started it. |
+| `SignedIn`, `Account` | Whether the request carried a valid access token. `Account` is nil for a signed-out request. |
+| `Account.Subject`, `Account.Scopes()`, `Account.HasScope`, `Account.Audience`, `Account.Expires`, `Account.TokenType` | The user in your organization and the access token. Find account data by `Account.Subject`, never by `UserID`. |
+| `Version`, `Extensions` | The `Poppy-Version` of the request and the extensions that it declares. |
+| `Raw` | The complete decoded answer. |
+
+**Look up a Session and end one.** A website that joined a browser to a Session asks
+LumoAuth about the Session on each page request:
+
+```go
+status, err := client.Poppy.GetSessionStatus(ctx, personalAgent, sid) // ClientID and Session.SID
+if err != nil {
+    return err
+}
+if !status.Active() {
+    // The Session ended or is unknown: drop the cookie.
+}
+if !status.SignedIn || status.Account != joinedAccount {
+    // Keep the Session, and treat the browser as signed out.
+}
+```
+
+End a Session when your own rules call for it, for example after a fraud signal. The user
+stays signed in, and the personal agent starts a new Session with its next request:
+
+```go
+ended, err := client.Poppy.EndSession(ctx, personalAgent, sid)
+```
+
+`ended` is `false` when the Session had ended before. An unknown Session gives
+`ErrNotFound` from `EndSession`, and the status `unknown` from `GetSessionStatus`.
+
+The three calls return these errors. None of them is about the personal agent, so never
+relay one:
+
+| Error | Cause |
+| --- | --- |
+| `ErrConfig` | The client has no client credentials, or `PublicOrigin` is missing. On the platform host, a client without an organization ID gets it too. No request is sent. |
+| `ErrValidation` | An argument is empty, or LumoAuth's answer is neither a verified result nor a well-formed refusal. The SDK never returns such an answer as verified. |
+| `ErrAPI` with status 400 | LumoAuth did not accept the forwarded request. One cause is a `PublicOrigin` that is not `https://`: plain `http://` is accepted only for `localhost`, `127.0.0.1` and `[::1]`. |
+| `ErrAuthentication` | 401: the client ID or secret is wrong, or the application is not a confidential application of this organization. |
+| `ErrPermissionDenied` | 403: the application's allowed scopes lack `poppy:verify`. |
+| `ErrNotFound` | 404: unknown organization, the protocol is switched off, or `EndSession` named an unknown Session. |
+| `ErrRateLimited` | 429: your application sent too many calls. `APIError.RetryAfter` says when to retry. |
+| `ErrNetwork` | The SDK could not reach LumoAuth. |
+
+See [Session verification](https://docs.lumoauth.dev/agents/personal-agent-protocol-verify)
+for the endpoints, the checks that LumoAuth runs and the protocol's error codes.
+
 ### AAuth: cryptographic agent identity
 
 AAuth extends OAuth 2.1 for agents that hold their own signing key. Tokens are bound to the
@@ -976,7 +1332,8 @@ aauth, err := lumoauth.NewAAuthClient(lumoauth.AAuthConfig{
 | --- | --- | --- |
 | `AgentIdentifier` | The HTTPS URL that identifies the agent (required) | none |
 | `PrivateKeyPEM` | An Ed25519 (PKCS#8) or RSA private key (required) | none |
-| `BaseURL`, `OrgID` | As for `New` | the environment variables |
+| `BaseURL`, `OrgID`, `CustomDomain` | As for `New` | the environment variables |
+| `Issuer` | The AAuth issuer. Set it only to override the default. | `{BaseURL}/orgs/{OrgID}/api/v1`; with `CustomDomain`, the value in the issuer metadata document. See [AAuth on a custom domain](#aauth-on-a-custom-domain). |
 | `Kid` | The key ID in the registered JWKS | `key-1` |
 | `Timeout`, `HTTPClient`, `SkipCertValidation` | As for `New` | 30 seconds, a new client, off |
 
@@ -1021,6 +1378,7 @@ Other `AAuthClient` methods:
 | `Refresh(ctx, params)` | Renews an auth token with a refresh token and a resource token from the same resource. `Scope` only narrows: a scope outside the grant is refused with `invalid_scope` |
 | `Revoke(ctx, token, tokenType, agentToken)` | Revokes an auth token (by its `jti`, with `AAuthTokenTypeAuth`) or a refresh token (with `AAuthTokenTypeRefresh`) |
 | `DiscoverIssuer`, `DiscoverAgents`, `DiscoverResource`, `JWKS` | Read the metadata documents |
+| `Issuer()`, `ResolveIssuer(ctx)` | The AAuth issuer. `ResolveIssuer` reads it from the metadata document on a custom domain. |
 | `SignRequest(method, url, opts)` | Builds the signature headers without sending the request |
 | `PublicJWK`, `PublicJWKThumbprint` | Return the agent's public key and its RFC 7638 thumbprint |
 
@@ -1072,6 +1430,14 @@ claims, err := lumoauth.VerifyAuthToken(ctx, token, lumoauth.VerifyOptions{
 })
 ```
 
+For an organization on a [custom domain](#use-a-custom-domain), set
+`VerifyOptions.CustomDomain` and leave `Issuer` empty. The keys then come from
+`https://auth.acme.com/api/v1/aauth/jwks.json`, and
+`NewJWKSCacheForCustomDomain("auth.acme.com", time.Hour, nil)` caches them. The trusted
+issuer is not the bare domain: AAuth tokens name the platform form of the issuer on every
+host. The SDK reads it from the domain's issuer metadata document. See
+[AAuth on a custom domain](#aauth-on-a-custom-domain).
+
 `VerifyOptions.ClockSkew` adds tolerance to the expiry check. It defaults to zero, like the
 server. Local verification does not check revocation. For checks that must detect revoked
 tokens, use the server's introspection endpoint.
@@ -1094,6 +1460,9 @@ err = client.Do(ctx, http.MethodGet, path, nil, &page)
 
 `DoRaw` returns the `*http.Response` instead. You must close its body.
 
+On a [custom domain](#use-a-custom-domain), `OrgPath` returns the path without the
+`/orgs/...` segment, so this example works unchanged.
+
 You can also use the generated OpenAPI client, which covers the full REST API. This SDK does
 not depend on it, so that your build stays small. `APIConfig` gives you its settings:
 
@@ -1111,7 +1480,9 @@ api := lumoauthclient.NewAPIClient(cfg)
 ```
 
 `APIConfig` sets exactly one credential header, the one that matches the client's credential.
-It reads the current bearer token, so call it again after the token changes.
+It reads the current bearer token, so call it again after the token changes. On a custom
+domain the generated client also needs `WithOrgID`; see
+[Use a custom domain](#use-a-custom-domain).
 
 ## Errors
 
@@ -1279,6 +1650,19 @@ All of them need an agent credential. Portal test tokens are refused.
 | `TokenDetailed(...)` | The same, with the full response |
 | `AuthorizeTool(ctx, McpToolAuthorizeParams)` | May a user or agent run this tool? Called by the MCP server with its own token (`mcp:authorize`); a deny returns `Allowed` false |
 
+### `client.Poppy`
+
+| Method | What it does |
+| --- | --- |
+| `VerifyRequest(ctx, PoppyRequest, opts)` | Asks LumoAuth who a request from a personal agent is from; a refusal returns `Active` false with the response to relay |
+| `VerifyHTTPRequest(ctx, publicOrigin, r, opts)` | The same for a `*http.Request` |
+| `Middleware(PoppyMiddlewareOptions)` | `net/http` middleware that verifies each request and relays a refusal |
+| `GetSessionStatus(ctx, personalAgent, sid)` | Whether a Session is active, ended or unknown, and whether its account is still signed in |
+| `EndSession(ctx, personalAgent, sid)` | Ends a Session; false when it had ended before |
+
+All of them need `WithClientCredentials` with a confidential application whose allowed
+scopes include `poppy:verify`. They send HTTP Basic and no other credential.
+
 ### `DPoPSigner`
 
 | Method | What it does |
@@ -1295,13 +1679,15 @@ All of them need an agent credential. Portal test tokens are refused.
 | `New`, `NewAgent`, `NewWebAuth`, `NewAAuthClient` | Constructors |
 | `NewJITContext(source, opts...)` | A JIT context over an `Agent` or any `TokenSource` |
 | `NewDelegationChain(agent, redirectURI)` | A delegation manager |
-| `VerifyAuthToken`, `NewJWKSCache`, `FetchIssuerJWKS` | Verify AAuth tokens |
-| `VerifyAccessToken`, `RequireAccessToken`, `AccessTokenFromContext`, `DPoPRequestFromHTTP`, `NewAccessTokenKeyCache`, `FetchAccessTokenJWKS`, `NewMemoryReplayCache`, `RejectionReason` | Verify LumoAuth access tokens in an MCP server |
+| `VerifyAuthToken`, `NewJWKSCache`, `NewJWKSCacheForCustomDomain`, `FetchIssuerJWKS` | Verify AAuth tokens |
+| `VerifyAccessToken`, `RequireAccessToken`, `AccessTokenFromContext`, `DPoPRequestFromHTTP`, `NewAccessTokenKeyCache`, `NewAccessTokenKeyCacheForCustomDomain`, `FetchAccessTokenJWKS`, `NewMemoryReplayCache`, `RejectionReason` | Verify LumoAuth access tokens in an MCP server |
 | `NewDPoPSigner`, `NewDPoPSignerEd25519`, `NewDPoPSignerFromKey`, `LoadDPoPSigner`, `GenerateDPoPKeyPEM`, `DPoPBound`, `DPoPAccessTokenHash` | DPoP keys and helpers |
 | `GenerateKeypair`, `LoadPrivateKey`, `PublicJWK`, `SignRequest` | AAuth key and signing helpers |
 | `UserFromContext`, `TokensFromContext` | Read the session in a handler |
+| `PoppyFromContext`, `ContextWithPoppy`, `WritePoppyRefusal`, `BuildPoppyVerifyBody` | Personal Agent Protocol: read the verified result in a handler, relay a refusal, build the request body |
 | `AsAPIError`, `StatusCode`, `ErrorCode` | Error helpers |
-| `RoutePath`, `RouteNames`, `BuildPath` | The route registry |
+| `RoutePath`, `RouteNames`, `BuildPath` | The route registry. Its paths are in the platform form, with `/orgs/{orgId}`. |
+| `IssuerFor(baseURL, orgID)` | The issuer of an organization on the platform host. `client.Issuer()` also covers a custom domain. |
 
 ## Troubleshooting
 
@@ -1322,15 +1708,25 @@ All of them need an agent credential. Portal test tokens are refused.
 | `ValidationError` from `AuthorizeTool` or `AuthorizeMcpTool` about the server ID | The ID is a URL | Pass the registered server ID, for example `mcp_0123456789abcdef01234567` |
 | 403 `insufficient_scope` or `forbidden` from `Mcp.AuthorizeTool` | The token lacks `mcp:authorize`, or its client is not a tool authorizer of the server | Request `mcp:authorize` with the MCP server's own client, and list that client as a tool authorizer |
 | 400 `invalid_target` from `Mcp.Token` | The server URL uses plain `http` on a public host, or has a fragment | Use an `https` URL with no `#` part |
+| `ErrConfig` from a `client.Poppy` call that mentions `poppy:verify` | The client has no client credentials | Pass `WithClientCredentials` with the client ID and secret of a confidential application |
+| 403 `insufficient_scope` from a `client.Poppy` call | The application's allowed scopes lack `poppy:verify` | Add the scope to the application under **Applications** |
+| Every request of a personal agent is refused with `invalid_session` and a description that names the URL (`htu`) | The URL that your API sent differs from the URL that the personal agent called | Set `PublicOrigin` to the public address, with the base path that a proxy removes |
+| A personal agent gets `500` with `{"error":"server_error"}` | The verification call failed, and the middleware has no `OnError` | Set `OnError` to log the error, then fix the cause that it names |
 | `ErrRateLimited` | Too many requests | Wait for `APIError.RetryAfter`, then retry |
-| `ErrConfig` mentioning the organization | The call needs an org ID | Set `WithOrgID` or `LUMOAUTH_ORG_ID` |
+| `ErrConfig` mentioning the organization | The call needs an org ID | Set `WithOrgID` or `LUMOAUTH_ORG_ID`. With a custom domain, set `WithCustomDomain` and no org ID is needed. |
+| 404 from every call to an organization's own domain | The domain is set as the base URL, so the paths carry `/orgs/...` | Pass the domain with `WithCustomDomain` or `LUMOAUTH_CUSTOM_DOMAIN`, not with `WithBaseURL` |
+| `ErrConfig` about an invalid custom domain | The value has a path, a query or credentials, or it uses `http://` on a public host | Pass the host name alone, for example `auth.acme.com` |
+| An access token is rejected with `wrong_issuer` after a move to a custom domain | Access tokens that are issued through the custom domain name the bare domain as issuer | Set `CustomDomain` in `AccessTokenVerifyOptions` in place of `Issuer` |
+| `VerifyAuthToken` answers `untrusted issuer` for an AAuth token on a custom domain | `VerifyOptions.Issuer` is set to the custom domain, but AAuth tokens name the platform form | Leave `Issuer` empty and set `CustomDomain` |
 | The session is lost after every restart | `SessionSecret` changes at each start | Load a fixed secret from your configuration |
 | The session cookie is not set during local development | The cookie is `Secure` and the app uses plain HTTP | Set `CookieSecure: lumoauth.Bool(false)` in development only |
 
 ## Versioning and compatibility
 
-The SDK reports itself as `lumoauth-go/1.0.0` in the `User-Agent` header (`lumoauth.Version`).
-The module has no release tag yet. It needs a LumoAuth server whose API is version 1.0.0 or later.
+`go get github.com/lumoauth/lumo-auth-go` installs the latest version. The
+[release notes](release-notes) list every version and what changed in it. The SDK sends its
+own version in the `User-Agent` header, as `lumoauth-go/` followed by the value of
+`lumoauth.Version`. It needs a LumoAuth server whose API is version 1.0.0 or later.
 
 Every endpoint that this SDK calls is listed in `routes.go`. A test compares that list with
 the server's OpenAPI spec and with the shared SDK contract (`../sdk-contract`). A route that is

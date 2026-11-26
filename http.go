@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,13 +19,21 @@ import (
 //
 //   - injects credentials: a tokenProvider yields a bearer token
 //     (Authorization: Bearer …), an apiKey is sent as X-API-Key. The two are
-//     never sent together — the server rejects ambiguous credentials.
+//     never sent together — the server rejects ambiguous credentials. A
+//     request with Basic set carries HTTP Basic instead of both.
 //   - maps error statuses onto the typed errors in errors.go, reading
 //     error / code / error_description / message out of JSON bodies.
 //   - wraps transport failures in *NetworkError.
 //   - decodes successful JSON responses into a caller-supplied value.
 type httpClient struct {
-	baseURL       string
+	baseURL string
+	// customDomain is the organization's custom domain as a normalized
+	// origin, or "". When it is set, baseURL equals it and no path carries
+	// the /orgs/{orgId} segment; see resolve.
+	customDomain string
+	// configErr, when set, is returned by every request and every address:
+	// the client was built from a configuration that is not valid.
+	configErr     error
 	orgID         string
 	apiKey        string
 	tokenProvider TokenProvider
@@ -84,8 +93,24 @@ type request struct {
 	// NoAuth suppresses credential injection (OAuth token endpoints
 	// authenticate through the form body instead).
 	NoAuth bool
+	// Basic authenticates the call with HTTP Basic (RFC 7617) and with
+	// nothing else: no bearer token and no API key is sent, even when the
+	// client holds one. The Personal Agent Protocol calls use it.
+	Basic *basicCredentials
 	// Timeout overrides the client default for this call.
 	Timeout time.Duration
+}
+
+// basicCredentials are a client ID and a client secret for HTTP Basic.
+type basicCredentials struct {
+	id     string
+	secret string
+}
+
+// header returns the Authorization value. The two values are sent as they
+// are, without percent-encoding: the server does not decode them.
+func (b *basicCredentials) header() string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(b.id+":"+b.secret))
 }
 
 // call invokes a route from the registry, filling {orgId} from the client
@@ -99,16 +124,30 @@ func (c *httpClient) call(ctx context.Context, routeName string, params map[stri
 }
 
 // resolve turns a route name plus params into a concrete method and path.
+//
+// This is the one place that decides how a route is addressed. On the
+// platform host the path carries /orgs/{orgId}, filled from the client. On
+// a custom domain the segment is removed and the organization ID is not
+// needed; one that is given is never put in the path. Everything else that
+// needs an address of the organization goes through here: call, routeURL
+// (the authorization URL, the DPoP htu, the AAuth request URLs) and issuer.
 func (c *httpClient) resolve(routeName string, params map[string]string) (method, path string, err error) {
+	if c.configErr != nil {
+		return "", "", c.configErr
+	}
 	route, ok := Routes[routeName]
 	if !ok {
 		return "", "", configErrorf("unknown route %q", routeName)
+	}
+	template := route.Path
+	if c.customDomain != "" {
+		template = pathOnCustomDomain(template)
 	}
 	filled := make(map[string]string, len(params)+1)
 	for k, v := range params {
 		filled[k] = v
 	}
-	if strings.Contains(route.Path, "{orgId}") && filled["orgId"] == "" {
+	if strings.Contains(template, "{orgId}") && filled["orgId"] == "" {
 		if c.orgID == "" {
 			return "", "", configErrorf(
 				"org ID is required for %q — pass WithOrgID to the client or set LUMOAUTH_ORG_ID",
@@ -116,20 +155,74 @@ func (c *httpClient) resolve(routeName string, params map[string]string) (method
 		}
 		filled["orgId"] = c.orgID
 	}
-	path, err = BuildPath(route.Path, filled)
+	path, err = BuildPath(template, filled)
 	if err != nil {
 		return "", "", err
 	}
 	return route.Method, path, nil
 }
 
-// orgPath prefixes a path with the org-scoped API base.
+// routeURL is the absolute URL of a route for this client: the base URL,
+// or the custom domain, followed by the path that resolve gives.
+func (c *httpClient) routeURL(routeName string, params map[string]string) (string, error) {
+	_, path, err := c.resolve(routeName, params)
+	if err != nil {
+		return "", err
+	}
+	return c.baseURL + path, nil
+}
+
+// issuer is the issuer identifier of the organization: the bare custom
+// domain, or {baseURL}/orgs/{orgID}/api/v1 on the platform host. It is the
+// `iss` of the organization's tokens and the audience of a client
+// assertion. On the platform host it needs the organization ID.
+func (c *httpClient) issuer() (string, error) {
+	if c.customDomain != "" {
+		return c.customDomain, nil
+	}
+	return c.orgPrefixed("")
+}
+
+// orgPath prefixes a path with the organization's API base: /api/v1 on a
+// custom domain, /orgs/{orgID}/api/v1 on the platform host.
 func (c *httpClient) orgPath(path string) (string, error) {
+	if c.configErr != nil {
+		return "", c.configErr
+	}
+	if c.customDomain != "" {
+		return "/api/v1" + path, nil
+	}
 	if c.orgID == "" {
 		return "", NewConfigError(
 			"org ID is required for this call — pass WithOrgID to the client or set LUMOAUTH_ORG_ID")
 	}
 	return "/orgs/" + url.PathEscape(c.orgID) + "/api/v1" + path, nil
+}
+
+// orgPrefixed is baseURL + orgPath(path).
+func (c *httpClient) orgPrefixed(path string) (string, error) {
+	orgPath, err := c.orgPath(path)
+	if err != nil {
+		return "", err
+	}
+	return c.baseURL + orgPath, nil
+}
+
+// ownPath adapts a path that a caller wrote by hand (Client.Do, the
+// generated API client) to a custom domain: it removes the /orgs/{orgID}
+// segment of the client's own organization. It changes nothing on the
+// platform host, when the organization ID is not known, or for a path of
+// another organization: the SDK never guesses.
+func (c *httpClient) ownPath(path string) string {
+	if c.customDomain == "" || c.orgID == "" {
+		return path
+	}
+	for _, prefix := range []string{"/orgs/" + url.PathEscape(c.orgID), "/orgs/" + c.orgID} {
+		if rest, ok := strings.CutPrefix(path, prefix); ok && (strings.HasPrefix(rest, "/") || rest == "" || strings.HasPrefix(rest, "?")) {
+			return rest
+		}
+	}
+	return path
 }
 
 // do sends a request to a path (joined to baseURL) or an absolute URL, maps
@@ -176,10 +269,13 @@ func (c *httpClient) doRaw(ctx context.Context, method, pathOrURL string, req *r
 	if req == nil {
 		req = &request{}
 	}
+	if c.configErr != nil {
+		return nil, c.configErr
+	}
 
 	target := pathOrURL
 	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
-		target = c.baseURL + target
+		target = c.baseURL + c.ownPath(target)
 	}
 	if len(req.Query) > 0 {
 		sep := "?"
@@ -251,6 +347,14 @@ func (c *httpClient) doRaw(ctx context.Context, method, pathOrURL string, req *r
 // injectCredentials adds exactly one credential header, unless the caller
 // already supplied one or asked for an unauthenticated request.
 func (c *httpClient) injectCredentials(ctx context.Context, httpReq *http.Request, req *request) error {
+	if req.Basic != nil {
+		// Basic replaces every other credential, including one that a
+		// WithHeader option or the caller put on the request.
+		httpReq.Header.Del("X-API-Key")
+		httpReq.Header.Del("DPoP")
+		httpReq.Header.Set("Authorization", req.Basic.header())
+		return nil
+	}
 	if req.NoAuth {
 		return nil
 	}
