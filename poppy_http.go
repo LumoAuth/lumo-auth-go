@@ -25,11 +25,13 @@ type PoppyMiddlewareOptions struct {
 	// AllowReplay accepts a Session JWT that was verified before.
 	AllowReplay bool
 	// OnError is called when the verification call itself fails: the SDK
-	// could not reach LumoAuth, or LumoAuth rejected your application. It
-	// must answer the request. Never write err to the response: it is about
-	// your service, not about the personal agent. When OnError is nil, the
-	// middleware answers 500 with a fixed body. The SDK does not log, so
-	// set OnError to record the error.
+	// could not reach LumoAuth, or LumoAuth refused your application's call
+	// (for example 404 not_found while the organization has the protocol
+	// switched off: errors.Is(err, ErrNotFound)). It must answer the
+	// request. Never write err to the response: it is about your service,
+	// not about the personal agent. When OnError is nil, the middleware
+	// answers 503 with the fixed body {"error":"temporarily_unavailable",…}.
+	// The SDK does not log, so set OnError to record the error.
 	OnError func(w http.ResponseWriter, r *http.Request, err error)
 }
 
@@ -55,8 +57,8 @@ type PoppyMiddlewareOptions struct {
 //   - Refused: it answers with LumoAuth's response, unchanged, and does not
 //     call the handler.
 //   - The call failed: it does not call the handler and relays nothing. It
-//     calls OnError, or answers 500 with a fixed body. The error text never
-//     reaches the personal agent.
+//     calls OnError, or answers 503 Service Unavailable with a fixed body.
+//     The error text never reaches the personal agent.
 //
 // The URL that LumoAuth checks is PublicOrigin followed by the path of
 // r.RequestURI. The Host and X-Forwarded-* headers are never used. Because
@@ -113,14 +115,22 @@ func (r *PoppyResource) Middleware(opts PoppyMiddlewareOptions) (func(http.Handl
 	}, nil
 }
 
-// writePoppyFailure is the answer for a failed verification call when no
-// OnError is set: a fixed body that says nothing about the cause.
+// poppyUnavailableBody is the answer for a failed verification call when no
+// OnError is set. It says nothing about the cause, which concerns this
+// service and not the personal agent.
+const poppyUnavailableBody = `{"error":"temporarily_unavailable","error_description":"Requests from personal agents cannot be verified right now."}`
+
+// writePoppyFailure answers a failed verification call when no OnError is
+// set: 503, because the service cannot verify the request now (the
+// protocol is switched off, the application's credential is refused,
+// LumoAuth is out of reach). It is never a 500, and never a refusal of the
+// personal agent's own credentials.
 func writePoppyFailure(w http.ResponseWriter, _ *http.Request, _ error) {
 	header := w.Header()
 	header.Set("Content-Type", "application/json")
 	header.Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusInternalServerError)
-	_, _ = w.Write([]byte(`{"error":"server_error"}`))
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte(poppyUnavailableBody))
 }
 
 type poppyContextKey struct{}

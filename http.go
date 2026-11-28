@@ -405,7 +405,7 @@ func apiErrorFromResponse(resp *http.Response, body []byte) *APIError {
 	if resp.StatusCode == http.StatusTooManyRequests {
 		apiErr.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
 	}
-	return apiErr
+	return withBodyCodeError(apiErr, code)
 }
 
 // parseBody decodes a response body: a map for JSON objects, the raw string

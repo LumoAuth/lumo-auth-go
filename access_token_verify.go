@@ -158,6 +158,11 @@ const (
 	TokenRejectedDPoPProof    = "dpop_proof"
 	TokenRejectedDPoPBinding  = "dpop_binding"
 	TokenRejectedDPoPReplay   = "dpop_replay"
+	// TokenRejectedDPoPNonce: the proof lacks the nonce that the resource
+	// server expects (DPoPRequest.Nonce), or carries another one. Answer it
+	// with use_dpop_nonce and the expected value in DPoP-Nonce (RFC 9449
+	// §9); RequireAccessToken does this.
+	TokenRejectedDPoPNonce = "dpop_nonce"
 )
 
 // RejectionReason returns the TokenRejected* reason carried by err, or ""
@@ -190,6 +195,11 @@ type DPoPRequest struct {
 	// Scheme is the Authorization scheme the token came with: "DPoP" or
 	// "Bearer".
 	Scheme string
+	// Nonce is the nonce that this resource server expects in the proof
+	// (RFC 9449 §9), when it issues nonces. "" means no nonce check. A
+	// proof without it, or with another value, is refused with
+	// TokenRejectedDPoPNonce.
+	Nonce string
 }
 
 // DPoPRequestFromHTTP reads the DPoP-relevant parts of an incoming request.
@@ -312,6 +322,13 @@ type AccessTokenVerifyOptions struct {
 	// ReplayCache stores proof identifiers. Defaults to a process-wide
 	// in-memory cache.
 	ReplayCache ReplayCache
+	// DPoPNonce gives RequireAccessToken the nonce that this resource
+	// server expects in the DPoP proof of a request (DPoPRequest.Nonce), for
+	// a server that issues nonces. A proof without it gets 401 with
+	// error="use_dpop_nonce" and the value in a DPoP-Nonce header, so the
+	// client can retry. Nil (or "") means no nonce check. VerifyAccessToken
+	// does not call it: set DPoP.Nonce there.
+	DPoPNonce func(r *http.Request) string
 }
 
 // Verification windows shared with the server.
@@ -608,6 +625,14 @@ func verifyDPoPBinding(token, jkt string, opts AccessTokenVerifyOptions, skew ti
 	if jti == "" {
 		return rejectToken(TokenRejectedDPoPProof, "the DPoP proof has no jti claim")
 	}
+	// Checked before the replay cache, so a proof refused for its nonce
+	// does not use up its jti.
+	if req.Nonce != "" {
+		nonce, _ := claims["nonce"].(string)
+		if subtle.ConstantTimeCompare([]byte(nonce), []byte(req.Nonce)) != 1 {
+			return rejectToken(TokenRejectedDPoPNonce, "the DPoP proof does not carry the nonce that this server expects")
+		}
+	}
 	cache := opts.ReplayCache
 	if cache == nil {
 		cache = defaultReplayCache
@@ -882,8 +907,10 @@ func ContextWithAccessToken(ctx context.Context, claims *AccessTokenClaims) cont
 // (opts.DPoP is filled from each request; DPoPRequestFromHTTP documents
 // how the URL is derived). A missing or invalid token gets 401 with a
 // WWW-Authenticate challenge (RFC 6750 and RFC 9449 §7.1) and a JSON body
-// {"error": "invalid_token", "error_description": …}. When opts.JWKS is
-// nil the middleware keeps one key cache for the issuer.
+// {"error": "invalid_token", "error_description": …}. With opts.DPoPNonce, a
+// proof without the expected nonce gets error="use_dpop_nonce" and the nonce
+// in a DPoP-Nonce header instead (RFC 9449 §9). When opts.JWKS is nil the
+// middleware keeps one key cache for the issuer.
 func RequireAccessToken(opts AccessTokenVerifyOptions) func(http.Handler) http.Handler {
 	if opts.JWKS == nil && opts.KeyCache == nil {
 		// A configuration error leaves the cache unset. VerifyAccessToken
@@ -902,8 +929,17 @@ func RequireAccessToken(opts AccessTokenVerifyOptions) func(http.Handler) http.H
 			}
 			perRequest := opts
 			perRequest.DPoP = DPoPRequestFromHTTP(r)
+			if opts.DPoPNonce != nil {
+				perRequest.DPoP.Nonce = opts.DPoPNonce(r)
+			}
 			claims, err := VerifyAccessToken(r.Context(), token, perRequest)
 			if err != nil {
+				if RejectionReason(err) == TokenRejectedDPoPNonce {
+					// RFC 9449 §9: ask for a proof with the nonce to use.
+					w.Header().Set(DPoPNonceHeader, perRequest.DPoP.Nonce)
+					writeTokenChallenge(w, opts, "use_dpop_nonce", err.Error())
+					return
+				}
 				writeTokenChallenge(w, opts, "invalid_token", err.Error())
 				return
 			}
@@ -920,7 +956,10 @@ func writeTokenChallenge(w http.ResponseWriter, opts AccessTokenVerifyOptions, e
 		params += `, error="` + errorCode + `", error_description="` + strings.ReplaceAll(description, `"`, "'") + `"`
 	}
 	algs := `algs="` + strings.Join(dpopProofAlgorithms, " ") + `"`
-	if opts.RequireDPoP {
+	if errorCode == "use_dpop_nonce" {
+		// The error belongs to the DPoP scheme (RFC 9449 §9).
+		w.Header().Add("WWW-Authenticate", "DPoP "+params+", "+algs)
+	} else if opts.RequireDPoP {
 		w.Header().Add("WWW-Authenticate", "DPoP "+params+", "+algs)
 	} else {
 		w.Header().Add("WWW-Authenticate", "Bearer "+params)
@@ -929,6 +968,9 @@ func writeTokenChallenge(w http.ResponseWriter, opts AccessTokenVerifyOptions, e
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
 	body := map[string]string{"error": "invalid_token"}
+	if errorCode == "use_dpop_nonce" {
+		body["error"] = errorCode
+	}
 	if errorCode == "" {
 		body["error_description"] = "an access token is required"
 	} else {

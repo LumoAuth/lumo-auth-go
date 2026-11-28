@@ -3,7 +3,9 @@ package lumoauth
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"strconv"
+	"strings"
 )
 
 // ID is an identifier the API may send as either a JSON string or a JSON
@@ -118,10 +120,27 @@ type zanzibarExpandResponse struct {
 
 // AbacMatchedPolicy is a policy that contributed to an ABAC decision.
 type AbacMatchedPolicy struct {
+	// ID is the policy's ID as text. The server sends a number ({"id": 81}
+	// gives "81"); a string is accepted too, and null gives "".
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Effect   string `json:"effect"` // "allow" or "deny"
 	Priority int    `json:"priority"`
+}
+
+// UnmarshalJSON decodes the policy and accepts its ID as a number or a
+// string.
+func (p *AbacMatchedPolicy) UnmarshalJSON(data []byte) error {
+	type alias AbacMatchedPolicy
+	aux := struct {
+		*alias
+		ID ID `json:"id"`
+	}{alias: (*alias)(p)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	p.ID = aux.ID.String()
+	return nil
 }
 
 // AbacDecision is the outcome of evaluating ABAC policies for one
@@ -166,6 +185,8 @@ type AbacBulkDecision struct {
 
 // AbacAttributeDefinition describes an attribute the org has defined.
 type AbacAttributeDefinition struct {
+	// ID is the definition's ID as text. The server sends a number; a
+	// string is accepted too.
 	ID              string         `json:"id"`
 	Name            string         `json:"name"`
 	Slug            string         `json:"slug"`
@@ -173,7 +194,40 @@ type AbacAttributeDefinition struct {
 	AttributeType   string         `json:"attributeType,omitempty"` // user | resource | environment
 	DataType        string         `json:"dataType,omitempty"`      // string | number | boolean | array | date
 	ValidationRules map[string]any `json:"validationRules,omitempty"`
-	IsActive        bool           `json:"isActive,omitempty"`
+	// DefaultValue is the value an entity has when none is set; nil when the
+	// definition has none.
+	DefaultValue any `json:"defaultValue,omitempty"`
+	// IsRequired reports whether every entity must have a value.
+	IsRequired bool `json:"isRequired,omitempty"`
+	// IsSystem marks a definition that LumoAuth manages.
+	IsSystem bool `json:"isSystem,omitempty"`
+	// BuiltIn marks a definition that LumoAuth provides to every
+	// organization: readable, never writable by one.
+	BuiltIn bool `json:"builtIn,omitempty"`
+	// CreatedAt and UpdatedAt are RFC 3339 times; UpdatedAt is "" for a
+	// definition that was never changed.
+	CreatedAt string `json:"createdAt,omitempty"`
+	UpdatedAt string `json:"updatedAt,omitempty"`
+	// IsActive is not sent by the server and is always false.
+	//
+	// Deprecated: the server has no such flag; every listed definition
+	// applies.
+	IsActive bool `json:"isActive,omitempty"`
+}
+
+// UnmarshalJSON decodes the definition and accepts its ID as a number or a
+// string.
+func (d *AbacAttributeDefinition) UnmarshalJSON(data []byte) error {
+	type alias AbacAttributeDefinition
+	aux := struct {
+		*alias
+		ID ID `json:"id"`
+	}{alias: (*alias)(d)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	d.ID = aux.ID.String()
+	return nil
 }
 
 // ── OAuth ─────────────────────────────────────────────────────────────
@@ -226,7 +280,6 @@ func (u *UserInfo) UnmarshalJSON(data []byte) error {
 
 // ── Agents ────────────────────────────────────────────────────────────
 
-// AgentAskResult is the decision returned by the Ask API.
 // RecordedUsage is the usage that LumoAuth added to the agent's budget windows.
 type RecordedUsage struct {
 	Tokens  int     `json:"tokens"`
@@ -241,12 +294,28 @@ type UsageReportResult struct {
 	Budget   *AgentBudget  `json:"budget,omitempty"`
 }
 
+// Values of AgentAskResult.DecidedBy.
+const (
+	// DecidedByCapability: the agent's capabilities decided (no policy or
+	// relationship data applied).
+	DecidedByCapability = "capability"
+	// DecidedByPDP: the organization's policies and relationships decided.
+	DecidedByPDP = "pdp"
+	// DecidedByDenyOverride: an explicit ABAC deny overrode a capability that
+	// would have allowed the action.
+	DecidedByDenyOverride = "deny_override"
+)
+
+// AgentAskResult is the decision returned by the Ask API.
 type AgentAskResult struct {
-	Allowed bool           `json:"allowed"`
-	Action  string         `json:"action,omitempty"`
-	Reason  string         `json:"reason,omitempty"`
-	AuditID string         `json:"audit_id,omitempty"`
-	Context map[string]any `json:"context,omitempty"`
+	Allowed bool   `json:"allowed"`
+	Action  string `json:"action,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	// DecidedBy names the check that produced the answer: DecidedByCapability,
+	// DecidedByPDP or DecidedByDenyOverride. "" when the server did not say.
+	DecidedBy string         `json:"decided_by,omitempty"`
+	AuditID   string         `json:"audit_id,omitempty"`
+	Context   map[string]any `json:"context,omitempty"`
 
 	// Raw is the complete decoded decision.
 	Raw map[string]any `json:"-"`
@@ -292,10 +361,35 @@ func (i *AgentIdentity) ID() string {
 	return ""
 }
 
-// AgentBudget is the budget policy attached to an agent.
+// AgentBudget is the budget of an agent as UserInfo (budget_policy) and the
+// usage report return it: the limits that are set, the usage in the current
+// UTC windows, and the server's verdict. A limit that is not set is 0.
 type AgentBudget struct {
-	MaxTokensPerDay int `json:"max_tokens_per_day,omitempty"`
-	TokensUsedToday int `json:"tokens_used_today,omitempty"`
+	// Limits on API calls and model tokens.
+	MaxAPICallsPerHour int `json:"max_api_calls_per_hour,omitempty"`
+	MaxAPICallsPerDay  int `json:"max_api_calls_per_day,omitempty"`
+	MaxTokensPerHour   int `json:"max_tokens_per_hour,omitempty"`
+	MaxTokensPerDay    int `json:"max_tokens_per_day,omitempty"`
+	// Limits on cost, in USD. HardLimitUSD (`hard_limit`) and
+	// MaxCostPerDayUSD are both daily limits; the lower one applies.
+	MaxCostPerDayUSD   float64 `json:"max_cost_per_day_usd,omitempty"`
+	MaxCostPerMonthUSD float64 `json:"max_cost_per_month_usd,omitempty"`
+	HardLimitUSD       float64 `json:"hard_limit,omitempty"`
+
+	// Usage in the current UTC hour, day and month. Tokens and cost count
+	// only reported usage (Agent.ReportUsage).
+	APICallsThisHour   int     `json:"api_calls_this_hour,omitempty"`
+	APICallsToday      int     `json:"api_calls_today,omitempty"`
+	TokensUsedThisHour int     `json:"tokens_used_this_hour,omitempty"`
+	TokensUsedToday    int     `json:"tokens_used_today,omitempty"`
+	CostTodayUSD       float64 `json:"cost_today_usd,omitempty"`
+	CostThisMonthUSD   float64 `json:"cost_this_month_usd,omitempty"`
+
+	// MaxSteps and TimeoutSeconds are settings that LumoAuth stores and
+	// returns but does not enforce: your agent applies them. They are 0
+	// when unset or when the stored value is not a number.
+	MaxSteps       int `json:"-"`
+	TimeoutSeconds int `json:"-"`
 
 	// ReportedExhausted is the server's own verdict (`exhausted`): true when
 	// any limit (calls, tokens or cost, per hour, day or month) is reached.
@@ -314,13 +408,36 @@ func (b *AgentBudget) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*b = AgentBudget(a)
-	return json.Unmarshal(data, &b.Raw)
+	if err := json.Unmarshal(data, &b.Raw); err != nil {
+		return err
+	}
+	// The runtime settings come back as stored, so read them leniently: a
+	// value of another type must not make the whole UserInfo unreadable.
+	b.MaxSteps = wholeNumber(b.Raw["max_steps"])
+	b.TimeoutSeconds = wholeNumber(b.Raw["timeout_seconds"])
+	return nil
+}
+
+// wholeNumber reads a JSON number or a numeric string as an int, and gives 0
+// for anything else.
+func wholeNumber(value any) int {
+	switch v := value.(type) {
+	case float64:
+		if v > 0 && v < math.MaxInt32 {
+			return int(v)
+		}
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && f > 0 && f < math.MaxInt32 {
+			return int(f)
+		}
+	}
+	return 0
 }
 
 // Exhausted reports whether the agent's budget is spent, so the next metered
 // call would get 429. It uses the server's verdict when reported (any limit,
-// any window); otherwise it compares the daily token cap with today's usage,
-// and a policy without a daily cap is never exhausted.
+// any window); otherwise it compares every limit that is set with the usage
+// of its window, and a policy without limits is never exhausted.
 func (b *AgentBudget) Exhausted() bool {
 	if b == nil {
 		return false
@@ -328,10 +445,14 @@ func (b *AgentBudget) Exhausted() bool {
 	if b.ReportedExhausted != nil {
 		return *b.ReportedExhausted
 	}
-	if b.MaxTokensPerDay <= 0 {
-		return false
-	}
-	return b.TokensUsedToday >= b.MaxTokensPerDay
+	reached := func(limit, used float64) bool { return limit > 0 && used >= limit }
+	return reached(float64(b.MaxAPICallsPerHour), float64(b.APICallsThisHour)) ||
+		reached(float64(b.MaxAPICallsPerDay), float64(b.APICallsToday)) ||
+		reached(float64(b.MaxTokensPerHour), float64(b.TokensUsedThisHour)) ||
+		reached(float64(b.MaxTokensPerDay), float64(b.TokensUsedToday)) ||
+		reached(b.MaxCostPerDayUSD, b.CostTodayUSD) ||
+		reached(b.HardLimitUSD, b.CostTodayUSD) ||
+		reached(b.MaxCostPerMonthUSD, b.CostThisMonthUSD)
 }
 
 // AgentRegistration is the response to registering an agent.

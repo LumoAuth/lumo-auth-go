@@ -1,10 +1,16 @@
 package lumoauth
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
-// MaxDelegationDepth is the deepest delegation chain LumoAuth will issue
-// tokens for (user → agent → sub-agent).
-const MaxDelegationDepth = 3
+// MaxDelegationDepth is the number of actors that a delegation chain may
+// hold: the depth of the nested `act` claims of a token (user → agent →
+// sub-agent → … , the user not counted). LumoAuth refuses the exchange that
+// would add a sixth actor with 400 invalid_request ("Delegation chain too
+// deep: …"); DelegationChain reports it as a ValidationError.
+const MaxDelegationDepth = 5
 
 // DelegationResource covers the RFC 8693 delegation primitives — the raw
 // operations behind the Chain of Agency.
@@ -16,10 +22,101 @@ type DelegationResource struct {
 	auth *AuthResource
 }
 
+// ApplicationConsentParams describes the sign-in through which a person lets
+// an agent act for them. An agent never starts a sign-in: the person signs
+// in to an APPLICATION of your organization, the application redeems the
+// code, and the agent exchanges the person's access token (Exchange).
+type ApplicationConsentParams struct {
+	// ClientID is the application's client ID, never the agent's agt_… ID.
+	// Required.
+	ClientID string
+	// RedirectURI is one of the application's registered redirect URIs.
+	// Required.
+	RedirectURI string
+	// Scopes are what the agent may do for the person: scopes that the
+	// application is allowed and that the agent holds as capabilities.
+	// "openid" is added. Required.
+	Scopes []string
+	// State is the CSRF value echoed back to the redirect URI. Required.
+	State string
+	// CodeChallenge is the PKCE S256 challenge of a verifier that you keep
+	// for the code redemption. Required.
+	CodeChallenge string
+	// OfflineAccess asks for a refresh token (scope offline_access): the
+	// application needs it to renew the person's token and to revoke the
+	// grant.
+	OfflineAccess bool
+}
+
+// ApplicationConsentURL builds the authorization URL where a person signs
+// in to your application to let an agent act for them. The application
+// then redeems the code with ExchangeCode (its client ID, its secret when it
+// is confidential, and the PKCE verifier), and the agent calls Exchange with
+// the person's access token. Revoke the person's refresh token as the
+// application to end the delegation.
+func (r *DelegationResource) ApplicationConsentURL(params ApplicationConsentParams) (string, error) {
+	if params.ClientID == "" {
+		return "", NewValidationError("ClientID (the application's client ID) is required")
+	}
+	if isAgentID(params.ClientID) {
+		return "", NewValidationError(agentIDConsentRefusal)
+	}
+	if params.RedirectURI == "" {
+		return "", NewValidationError("RedirectURI (a registered redirect URI of the application) is required")
+	}
+	if len(params.Scopes) == 0 {
+		return "", NewValidationError("Scopes are required: without them the exchange grants the agent nothing")
+	}
+	if params.State == "" {
+		return "", NewValidationError("State is required")
+	}
+	if params.CodeChallenge == "" {
+		return "", NewValidationError("CodeChallenge (PKCE S256) is required")
+	}
+	return r.auth.AuthorizationURL(AuthorizationURLParams{
+		ClientID:            params.ClientID,
+		RedirectURI:         params.RedirectURI,
+		Scope:               consentScope(params.Scopes, params.OfflineAccess),
+		State:               params.State,
+		CodeChallenge:       params.CodeChallenge,
+		CodeChallengeMethod: "S256",
+	})
+}
+
+// consentScope is "openid", the scopes, and offline_access when asked for,
+// each once.
+func consentScope(scopes []string, offlineAccess bool) string {
+	all := []string{"openid"}
+	seen := map[string]bool{"openid": true}
+	for _, scope := range scopes {
+		if !seen[scope] {
+			seen[scope] = true
+			all = append(all, scope)
+		}
+	}
+	if offlineAccess && !seen["offline_access"] {
+		all = append(all, "offline_access")
+	}
+	return joinScopes(all)
+}
+
+// isAgentID reports whether a client ID is an agent's ID (agt_…), which
+// cannot start a sign-in.
+func isAgentID(clientID string) bool { return strings.HasPrefix(clientID, "agt_") }
+
+const agentIDConsentRefusal = "an agent's ID (agt_…) cannot start a sign-in, LumoAuth answers \"Unknown Application\": " +
+	"build the consent URL with the client ID of an application (ApplicationConsentURL, or NewDelegationChainForApplication), " +
+	"then exchange the person's access token for the agent"
+
 // ConsentURLParams describes the consent redirect a user follows to let an
 // agent act on their behalf.
+//
+// Deprecated: use ApplicationConsentParams. LumoAuth starts a sign-in only
+// for an application, never for an agent's ID, and the agent's credentials
+// cannot redeem the code.
 type ConsentURLParams struct {
-	// ClientID is the agent's OAuth client. Required.
+	// ClientID is the OAuth client of the sign-in. Required. An agent's ID
+	// is refused.
 	ClientID string
 	// RedirectURI is where consent returns the user. Required.
 	RedirectURI string
@@ -30,9 +127,15 @@ type ConsentURLParams struct {
 	State string
 }
 
-// ConsentURL builds the URL where a user grants an agent delegated access.
-// It requests offline access so the agent receives a refresh token.
+// ConsentURL builds an authorization URL that requests offline access.
+//
+// Deprecated: use ApplicationConsentURL, which names an application, uses
+// PKCE and asks for offline_access. With an agent's ID this returns a
+// ValidationError: LumoAuth answers "Unknown Application" for it.
 func (r *DelegationResource) ConsentURL(params ConsentURLParams) (string, error) {
+	if isAgentID(params.ClientID) {
+		return "", NewValidationError(agentIDConsentRefusal)
+	}
 	scopes := params.Scopes
 	if len(scopes) == 0 {
 		scopes = []string{"documents:read"}
@@ -47,12 +150,16 @@ func (r *DelegationResource) ConsentURL(params ConsentURLParams) (string, error)
 	})
 }
 
-// ExchangeCode trades a consent callback code for the user's tokens.
+// ExchangeCode trades a consent callback code for the person's tokens. Pass
+// the APPLICATION's client ID (and its secret when it is confidential) and
+// the PKCE verifier; the agent's credentials are refused for the code.
 func (r *DelegationResource) ExchangeCode(ctx context.Context, params ExchangeCodeParams) (*TokenResponse, error) {
 	return r.auth.ExchangeCode(ctx, params)
 }
 
-// RefreshUserToken refreshes a user's delegated access token.
+// RefreshUserToken refreshes the person's access token, as the application
+// that holds the refresh token (its client ID, and its secret when it is
+// confidential).
 func (r *DelegationResource) RefreshUserToken(ctx context.Context, params RefreshTokenParams) (*TokenResponse, error) {
 	return r.auth.RefreshToken(ctx, params)
 }
@@ -83,8 +190,11 @@ func (r *DelegationResource) ExchangeForResource(ctx context.Context, subjectTok
 	})
 }
 
-// Revoke invalidates a delegation's refresh token, which also invalidates
-// every token derived from it.
+// Revoke invalidates the person's refresh token, which also ends every
+// token derived from it, the agent's delegated tokens included. Pass the
+// client ID (and secret) of the APPLICATION that the token was issued to:
+// LumoAuth refuses a revocation by another client, such as the agent
+// (RFC 7009 §2.1).
 func (r *DelegationResource) Revoke(ctx context.Context, params RevokeParams) error {
 	if params.TokenTypeHint == "" {
 		params.TokenTypeHint = "refresh_token"

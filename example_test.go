@@ -210,35 +210,49 @@ func ExampleNewJITContext() {
 	_ = token // present it to the resource
 }
 
-// Acting on behalf of a user, with the chain recorded in the token.
-func ExampleNewDelegationChain() {
+// Acting on behalf of a user, with the chain recorded in the token. The
+// person signs in to an application of the organization; the agent then
+// exchanges the person's token.
+func ExampleNewDelegationChainForApplication() {
 	agent, err := lumoauth.NewAgent(lumoauth.AgentConfig{})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	chain := lumoauth.NewDelegationChain(agent, "https://agent.example.com/callback")
+	chain, err := lumoauth.NewDelegationChainForApplication(agent, lumoauth.DelegationApplication{
+		ClientID:      os.Getenv("APP_CLIENT_ID"),
+		ClientSecret:  os.Getenv("APP_CLIENT_SECRET"), // empty for a public application
+		RedirectURI:   "https://app.example.com/agent/callback",
+		OfflineAccess: true, // a refresh token, to renew the person's token and to revoke
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	ctx := context.Background()
 
-	// 1. Send the user here to grant consent.
+	// 1. Send the person here to sign in to the application.
 	consentURL, err := chain.ConsentURL("session-1", []string{"documents:read"}, "")
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("visit:", consentURL)
 
-	// 2. Your callback receives ?code=…
+	// 2. Your callback receives ?code=…&state=… (compare the state with
+	// chain.ConsentState). The application redeems the code.
 	if err := chain.HandleConsentCallback(ctx, "session-1", "code-from-callback"); err != nil {
 		log.Fatal(err)
 	}
 
 	// 3. Call as "agent acting for user". The exchange happens on demand.
-	var documents struct {
-		Data []map[string]any `json:"data"`
-	}
-	if err := chain.Do(ctx, "session-1", http.MethodGet,
-		"/orgs/acme-corp/api/v1/documents", nil, &documents); err != nil {
+	resp, err := chain.DoRaw(ctx, "session-1", http.MethodGet, "https://api.example.com/documents", nil)
+	if err != nil {
 		log.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	// 4. End the delegation: the application revokes the person's refresh token.
+	if err := chain.Revoke(ctx, "session-1"); err != nil {
+		log.Print(err)
 	}
 }
 
@@ -284,7 +298,7 @@ func ExamplePoppyResource_Middleware() {
 		OnError: func(w http.ResponseWriter, r *http.Request, err error) {
 			// The error is about this service. Log it, and never send it.
 			log.Printf("Session verification failed: %v", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			http.Error(w, "not available now", http.StatusServiceUnavailable)
 		},
 	})
 	if err != nil {
@@ -318,7 +332,7 @@ func ExamplePoppyResource_VerifyHTTPRequest() {
 			&lumoauth.PoppyVerifyOptions{RequiredScope: []string{"orders:write"}})
 		if err != nil {
 			log.Printf("Session verification failed: %v", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			http.Error(w, "not available now", http.StatusServiceUnavailable)
 			return
 		}
 		if !verification.Active {

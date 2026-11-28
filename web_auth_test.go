@@ -23,6 +23,11 @@ type webAuthServer struct {
 
 	accessTokenExpiresIn int
 	userInfoStatus       int
+
+	// accessToken and idToken replace the short stand-in tokens, for tests
+	// that need tokens of a real size.
+	accessToken string
+	idToken     string
 }
 
 func (s *webAuthServer) handler() http.HandlerFunc {
@@ -37,10 +42,17 @@ func (s *webAuthServer) handler() http.HandlerFunc {
 			switch r.Form.Get("grant_type") {
 			case "authorization_code":
 				s.codeForms = append(s.codeForms, r.Form)
+				accessToken, idToken := "access-token", "id-token"
+				if s.accessToken != "" {
+					accessToken = s.accessToken
+				}
+				if s.idToken != "" {
+					idToken = s.idToken
+				}
 				writeJSON(w, 200, map[string]any{
-					"access_token":  "access-token",
+					"access_token":  accessToken,
 					"refresh_token": "refresh-token",
-					"id_token":      "id-token",
+					"id_token":      idToken,
 					"token_type":    "Bearer",
 					"expires_in":    expiresIn,
 					"scope":         "openid profile email",
@@ -658,5 +670,164 @@ func TestWebAuthSecureCookiesByDefault(t *testing.T) {
 	}
 	if !cookies[0].Secure {
 		t.Error("session cookies must be Secure unless the caller opts out")
+	}
+}
+
+func TestWebAuthLogoutEndsTheLumoAuthSession(t *testing.T) {
+	state := &webAuthServer{}
+	auth, server := newTestWebAuth(t, state)
+	cookies := completeLogin(t, auth)
+
+	req := httptest.NewRequest(http.MethodGet, "http://app.example.com/auth/logout", nil)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	auth.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+	location, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("Location: %v", err)
+	}
+	// RP-initiated logout at the organization's end-session endpoint, with
+	// the session's ID token and an absolute post-logout address.
+	if got := location.Scheme + "://" + location.Host + location.Path; got != server.URL+"/orgs/acme-corp/api/v1/oauth/logout" {
+		t.Errorf("logout goes to %q, want the end-session endpoint", got)
+	}
+	query := location.Query()
+	if query.Get("id_token_hint") != "id-token" {
+		t.Errorf("id_token_hint = %q, want the session's ID token", query.Get("id_token_hint"))
+	}
+	if query.Get("post_logout_redirect_uri") != "http://app.example.com/" {
+		t.Errorf("post_logout_redirect_uri = %q", query.Get("post_logout_redirect_uri"))
+	}
+	// The local session ends and the refresh token is revoked as before.
+	if len(state.revokeForms) != 1 {
+		t.Errorf("revocations = %d, want 1", len(state.revokeForms))
+	}
+	if user, _ := auth.User(requestWith(liveCookies(rec.Result().Cookies()))); user != nil {
+		t.Errorf("the local session should be cleared, got %+v", user)
+	}
+}
+
+func TestWebAuthLogoutPostLogoutAddress(t *testing.T) {
+	cases := []struct {
+		name     string
+		redirect string
+		headers  map[string]string
+		want     string
+	}{
+		{"absolute address kept", "https://www.example.com/bye", nil, "https://www.example.com/bye"},
+		{"path resolved against the request", "/goodbye?x=1", nil, "http://app.example.com/goodbye?x=1"},
+		{"forwarded origin", "/", map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "public.example.com"}, "https://public.example.com/"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer((&webAuthServer{t: t}).handler())
+			t.Cleanup(server.Close)
+			auth, err := NewWebAuth(WebConfig{
+				BaseURL: server.URL, Organization: "acme-corp", ClientID: "web-client",
+				ClientSecret: "web-secret", SessionSecret: testSessionSecret,
+				CookieSecure: Bool(false), PostLogoutRedirect: tc.redirect,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cookies := completeLogin(t, auth)
+			req := httptest.NewRequest(http.MethodGet, "http://app.example.com/auth/logout", nil)
+			for _, cookie := range cookies {
+				req.AddCookie(cookie)
+			}
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			auth.Router().ServeHTTP(rec, req)
+			location, _ := url.Parse(rec.Header().Get("Location"))
+			if got := location.Query().Get("post_logout_redirect_uri"); got != tc.want {
+				t.Errorf("post_logout_redirect_uri = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWebAuthLocalLogoutKeepsTheLumoAuthSession(t *testing.T) {
+	server := httptest.NewServer((&webAuthServer{t: t}).handler())
+	t.Cleanup(server.Close)
+	auth, err := NewWebAuth(WebConfig{
+		BaseURL: server.URL, Organization: "acme-corp", ClientID: "web-client",
+		ClientSecret: "web-secret", SessionSecret: testSessionSecret,
+		CookieSecure: Bool(false), LocalLogout: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookies := completeLogin(t, auth)
+	req := httptest.NewRequest(http.MethodGet, "http://app.example.com/auth/logout", nil)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	auth.Router().ServeHTTP(rec, req)
+	if got := rec.Header().Get("Location"); got != "/" {
+		t.Errorf("Location = %q, want the local PostLogoutRedirect", got)
+	}
+}
+
+func TestWebAuthLogoutWithoutASessionStaysLocal(t *testing.T) {
+	state := &webAuthServer{}
+	auth, _ := newTestWebAuth(t, state)
+	rec := httptest.NewRecorder()
+	auth.Router().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://app.example.com/auth/logout", nil))
+	if got := rec.Header().Get("Location"); got != "/" {
+		t.Errorf("Location = %q, want / for a visitor who is not signed in", got)
+	}
+	if len(state.revokeForms) != 0 {
+		t.Errorf("nothing should be revoked, got %d revocations", len(state.revokeForms))
+	}
+}
+
+func TestEndSessionURL(t *testing.T) {
+	client, err := New(WithAPIKey("lmk_x"), WithBaseURL("https://app.lumoauth.dev"), WithOrgID("acme-corp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.Auth.EndSessionURL(EndSessionURLParams{
+		IDTokenHint:           "eyJ.hint.sig",
+		PostLogoutRedirectURI: "https://app.example.com/bye",
+		State:                 "xyz",
+	})
+	if err != nil {
+		t.Fatalf("EndSessionURL: %v", err)
+	}
+	want := "https://app.lumoauth.dev/orgs/acme-corp/api/v1/oauth/logout?" +
+		"id_token_hint=eyJ.hint.sig&post_logout_redirect_uri=https%3A%2F%2Fapp.example.com%2Fbye&state=xyz"
+	if got != want {
+		t.Errorf("EndSessionURL =\n %s\nwant\n %s", got, want)
+	}
+
+	// Without parameters it is the bare endpoint.
+	bare, _ := client.Auth.EndSessionURL(EndSessionURLParams{})
+	if bare != "https://app.lumoauth.dev/orgs/acme-corp/api/v1/oauth/logout" {
+		t.Errorf("bare EndSessionURL = %q", bare)
+	}
+
+	// On a custom domain the endpoint has no /orgs/{orgId} segment.
+	custom, err := New(WithAPIKey("lmk_x"), WithCustomDomain("auth.acme.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	onDomain, err := custom.Auth.EndSessionURL(EndSessionURLParams{IDTokenHint: "h"})
+	if err != nil || onDomain != "https://auth.acme.com/api/v1/oauth/logout?id_token_hint=h" {
+		t.Errorf("custom-domain EndSessionURL = %q, %v", onDomain, err)
+	}
+
+	// A post-logout address must be absolute: LumoAuth compares it with the
+	// registered ones.
+	if _, err := client.Auth.EndSessionURL(EndSessionURLParams{PostLogoutRedirectURI: "/bye"}); !errors.Is(err, ErrValidation) {
+		t.Errorf("a relative post-logout address should be refused, got %v", err)
 	}
 }

@@ -361,6 +361,33 @@ func TestDelegationChainDepthLimit(t *testing.T) {
 	}
 }
 
+func TestDelegationChainDepthLimitOfTheServer(t *testing.T) {
+	// The server's answer to the exchange that would add a sixth actor
+	// (OAuthGrantService::assertActDepthWithinLimit).
+	state := &delegationServer{
+		exchangeStatus: http.StatusBadRequest,
+		exchangeBody: map[string]any{
+			"error":             "invalid_request",
+			"error_description": "Delegation chain too deep: act nesting depth 6 exceeds the maximum of 5",
+		},
+	}
+	chain, _ := newTestChain(t, state)
+	if err := chain.SetUserToken("session-1", "user-token"); err != nil {
+		t.Fatalf("SetUserToken: %v", err)
+	}
+	_, err := chain.Exchange(context.Background(), "session-1")
+	if !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), "too deep (maximum depth: 5)") {
+		t.Errorf("err = %v, want the depth limit of 5", err)
+	}
+	// The server's answer stays reachable.
+	if apiErr, ok := AsAPIError(err); !ok || apiErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("the APIError should stay in the chain: %v", err)
+	}
+	if MaxDelegationDepth != 5 {
+		t.Errorf("MaxDelegationDepth = %d, the server allows 5 actors", MaxDelegationDepth)
+	}
+}
+
 func TestDelegationChainOtherExchangeErrorsAreAnnotated(t *testing.T) {
 	state := &delegationServer{
 		exchangeStatus: http.StatusForbidden,
@@ -504,5 +531,26 @@ func TestDelegationChainIsConcurrencySafe(t *testing.T) {
 
 	if len(chain.ActiveSessions()) != 8 {
 		t.Errorf("ActiveSessions = %d, want 8", len(chain.ActiveSessions()))
+	}
+}
+
+func TestDelegationDepthRefusalReadsTheServersMaximum(t *testing.T) {
+	cases := []struct {
+		status int
+		body   map[string]any
+		depth  int
+		ok     bool
+	}{
+		{400, map[string]any{"error": "invalid_request", "error_description": "Delegation chain too deep: act nesting depth 8 exceeds the maximum of 7"}, 7, true},
+		{400, map[string]any{"error": "invalid_request", "error_description": "Delegation chain too deep"}, MaxDelegationDepth, true},
+		{403, map[string]any{"error": "delegation_depth_exceeded", "max_depth": 4.0}, 4, true},
+		{400, map[string]any{"error": "invalid_request", "error_description": "Invalid actor_token"}, 0, false},
+		{403, map[string]any{"error": "invalid_request", "error_description": "Delegation chain too deep"}, 0, false},
+	}
+	for _, tc := range cases {
+		depth, ok := delegationDepthRefusal(newAPIError(tc.status, "", "x", tc.body))
+		if depth != tc.depth || ok != tc.ok {
+			t.Errorf("%d %v: got (%d, %v), want (%d, %v)", tc.status, tc.body, depth, ok, tc.depth, tc.ok)
+		}
 	}
 }

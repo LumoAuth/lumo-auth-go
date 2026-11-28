@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -398,6 +399,39 @@ func TestAbacResource(t *testing.T) {
 		}
 	})
 
+	t.Run("Check accepts a policy ID sent as a number or a string", func(t *testing.T) {
+		// The server sends the ID as a JSON number ({"id": 81}); a caller
+		// without policies.view gets only the ID and the name, which may be
+		// null.
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
+			"allowed": true,
+			"reason":  "Access allowed by policy: Business hours",
+			"matchedPolicies": []map[string]any{
+				{"id": 81, "name": "Business hours"},
+				{"id": "p2", "name": nil},
+				{"id": nil, "name": "Unsaved"},
+			},
+		}))
+
+		decision, err := client.Abac.Check(ctx, AbacCheckParams{ResourceType: "document", Action: "read"})
+		if err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+		if len(decision.MatchedPolicies) != 3 {
+			t.Fatalf("matched policies = %+v", decision.MatchedPolicies)
+		}
+		if got := decision.MatchedPolicies[0]; got.ID != "81" || got.Name != "Business hours" {
+			t.Errorf("first policy = %+v, want ID \"81\"", got)
+		}
+		if got := decision.MatchedPolicies[1].ID; got != "p2" {
+			t.Errorf("second policy ID = %q, want \"p2\"", got)
+		}
+		if got := decision.MatchedPolicies[2].ID; got != "" {
+			t.Errorf("a null ID should decode as \"\", got %q", got)
+		}
+	})
+
 	t.Run("CheckBulk", func(t *testing.T) {
 		var calls []capture
 		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
@@ -536,6 +570,31 @@ func TestAbacResource(t *testing.T) {
 		}
 	})
 
+	t.Run("AttributeDefinitions accepts numeric IDs", func(t *testing.T) {
+		// The server's shape: a numeric ID, and the isRequired / isSystem /
+		// builtIn flags.
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
+			"data": []map[string]any{{
+				"id": 7, "name": "Department", "slug": "department", "attributeType": "user",
+				"dataType": "string", "validationRules": nil, "defaultValue": nil,
+				"isRequired": true, "isSystem": false, "builtIn": true,
+				"createdAt": "2026-11-27T10:00:00+00:00", "updatedAt": nil,
+			}},
+			"pagination": map[string]any{"total": 1, "page": 1, "limit": 1, "totalPages": 1},
+		}))
+		got, err := client.Abac.AttributeDefinitions(ctx, "user")
+		if err != nil {
+			t.Fatalf("AttributeDefinitions: %v", err)
+		}
+		if len(got) != 1 || got[0].ID != "7" || got[0].Slug != "department" {
+			t.Fatalf("definitions = %+v", got)
+		}
+		if !got[0].IsRequired || got[0].IsSystem || !got[0].BuiltIn {
+			t.Errorf("flags not decoded: %+v", got[0])
+		}
+	})
+
 	t.Run("validates required arguments", func(t *testing.T) {
 		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 			t.Error("no request should have been sent")
@@ -650,6 +709,98 @@ func TestAgentsResource(t *testing.T) {
 		}
 		if !budget.Exhausted() {
 			t.Error("a budget at its daily cap should report exhausted")
+		}
+	})
+
+	t.Run("Ask types decided_by", func(t *testing.T) {
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
+			"allowed": false, "action": "invoices:refund", "reason": "denied by policy",
+			"decided_by": "deny_override", "audit_id": "audit_1",
+		}))
+		result, err := client.Agents.Ask(ctx, "invoices:refund", nil)
+		if err != nil {
+			t.Fatalf("Ask: %v", err)
+		}
+		if result.DecidedBy != DecidedByDenyOverride {
+			t.Errorf("DecidedBy = %q, want %q", result.DecidedBy, DecidedByDenyOverride)
+		}
+	})
+
+	t.Run("Budget types every limit and counter of budget_policy", func(t *testing.T) {
+		// The shape of AgentUsageService::describeBudget().
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
+			"sub": "agent_1",
+			"budget_policy": map[string]any{
+				"max_api_calls_per_hour": 500, "max_api_calls_per_day": 5000,
+				"max_tokens_per_hour": 20000, "max_tokens_per_day": 100000,
+				"max_cost_per_day_usd": 5, "max_cost_per_month_usd": 50.5, "hard_limit": 4.25,
+				"max_steps": 12, "timeout_seconds": "300",
+				"api_calls_this_hour": 47, "api_calls_today": 310,
+				"tokens_used_this_hour": 1200, "tokens_used_today": 8000,
+				"cost_today_usd": 0.0042, "cost_this_month_usd": 1.5,
+				"exhausted": false,
+			},
+		}))
+		budget, err := client.Agents.Budget(ctx)
+		if err != nil {
+			t.Fatalf("Budget: %v", err)
+		}
+		want := AgentBudget{
+			MaxAPICallsPerHour: 500, MaxAPICallsPerDay: 5000,
+			MaxTokensPerHour: 20000, MaxTokensPerDay: 100000,
+			MaxCostPerDayUSD: 5, MaxCostPerMonthUSD: 50.5, HardLimitUSD: 4.25,
+			MaxSteps: 12, TimeoutSeconds: 300,
+			APICallsThisHour: 47, APICallsToday: 310,
+			TokensUsedThisHour: 1200, TokensUsedToday: 8000,
+			CostTodayUSD: 0.0042, CostThisMonthUSD: 1.5,
+		}
+		got := *budget
+		got.Raw, got.ReportedExhausted = nil, nil
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("budget =\n %+v\nwant\n %+v", got, want)
+		}
+		if budget.Exhausted() {
+			t.Error("the server's verdict (exhausted: false) wins")
+		}
+	})
+
+	t.Run("Budget accepts a stored runtime setting of another type", func(t *testing.T) {
+		// max_steps and timeout_seconds come back as stored; a value that is
+		// not a number must not break the decoding of UserInfo.
+		var calls []capture
+		client, _ := newTestClient(t, recordingHandler(t, &calls, map[string]any{
+			"sub":           "agent_1",
+			"budget_policy": map[string]any{"max_steps": "many", "timeout_seconds": 30.0},
+		}))
+		budget, err := client.Agents.Budget(ctx)
+		if err != nil {
+			t.Fatalf("Budget: %v", err)
+		}
+		if budget.MaxSteps != 0 || budget.TimeoutSeconds != 30 || budget.Raw["max_steps"] != "many" {
+			t.Errorf("budget = %+v", budget)
+		}
+	})
+
+	t.Run("Exhausted without the server's verdict checks every limit", func(t *testing.T) {
+		cases := map[string]AgentBudget{
+			"calls this hour":  {MaxAPICallsPerHour: 10, APICallsThisHour: 10},
+			"calls today":      {MaxAPICallsPerDay: 10, APICallsToday: 11},
+			"tokens this hour": {MaxTokensPerHour: 100, TokensUsedThisHour: 100},
+			"tokens today":     {MaxTokensPerDay: 100, TokensUsedToday: 100},
+			"cost today":       {MaxCostPerDayUSD: 1, CostTodayUSD: 1},
+			"daily hard limit": {HardLimitUSD: 2, CostTodayUSD: 2.5},
+			"cost this month":  {MaxCostPerMonthUSD: 10, CostThisMonthUSD: 10},
+		}
+		for name, budget := range cases {
+			if !budget.Exhausted() {
+				t.Errorf("%s: a reached limit should report exhausted: %+v", name, budget)
+			}
+		}
+		within := AgentBudget{MaxAPICallsPerHour: 10, APICallsThisHour: 9, MaxCostPerMonthUSD: 10, CostThisMonthUSD: 9.99}
+		if within.Exhausted() {
+			t.Errorf("a budget below every limit is not exhausted: %+v", within)
 		}
 	})
 

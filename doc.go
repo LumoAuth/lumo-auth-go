@@ -22,8 +22,9 @@ It exposes these entry points, one per kind of caller:
     [DPoPSigner] is the client side of DPoP (RFC 9449).
 
   - [WebAuth] — browser sign-in. Wires the OAuth 2.1 Authorization Code +
-    PKCE flow into any net/http-compatible router, with sessions in a
-    signed cookie.
+    PKCE flow into any net/http-compatible router, with sessions in an
+    encrypted cookie or in a session store of your choice
+    (WebConfig.Store).
 
   - [PoppyResource] (client.Poppy) — for an API that personal agents call
     (Personal Agent Protocol). It asks LumoAuth to verify the Poppy-Session

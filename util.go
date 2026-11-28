@@ -39,6 +39,22 @@ func splitScopes(scope string) []string {
 // joinScopes renders a scope slice for the wire.
 func joinScopes(scopes []string) string { return strings.Join(scopes, " ") }
 
+// isScopeToken reports whether s is one scope value of RFC 6749 §3.3:
+// one or more of the characters %x21 / %x23-5B / %x5D-7E (no space, no
+// double quote, no backslash).
+func isScopeToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x21 || c > 0x7E || c == '"' || c == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
 // decodeJWTPayload base64url-decodes a JWT's claims segment WITHOUT
 // verifying the signature. Use it for display and audit only; anything
 // security-relevant must go through VerifyAuthToken or the server.

@@ -96,6 +96,9 @@ type clientConfig struct {
 	dpop               *DPoPSigner
 	clientID           string
 	clientSecret       string
+	// credentialOptional lets New build a client without a credential
+	// (WithoutCredential).
+	credentialOptional bool
 }
 
 // WithBaseURL sets the LumoAuth instance URL. Defaults to $LUMOAUTH_URL,
@@ -162,6 +165,22 @@ func WithClientCredentials(clientID, clientSecret string) Option {
 	}
 }
 
+// WithoutCredential lets New build a client that holds no credential. Such
+// a client builds addresses (Auth.AuthorizationURL, Auth.EndSessionURL,
+// Issuer, OrgPath) and makes the calls that authenticate themselves: the
+// token endpoint calls of client.Auth (code exchange, refresh, client
+// credentials with a secret or an assertion, token exchange with client
+// authentication), Auth.Revoke, Auth.UserInfo with a token, and
+// Agents.Attest. A call that needs a credential is sent without one, and the
+// server's 401 is an error that matches ErrAuthentication.
+//
+// A credential given with another option or LUMOAUTH_API_KEY is still used.
+// Without this option, New refuses to build a client with no credential, so
+// that a missing API key is found at start-up.
+func WithoutCredential() Option {
+	return func(c *clientConfig) { c.credentialOptional = true }
+}
+
 // WithTimeout sets the per-request timeout. Default: 30s.
 func WithTimeout(timeout time.Duration) Option {
 	return func(c *clientConfig) { c.timeout = timeout }
@@ -204,8 +223,8 @@ func WithUserAgent(userAgent string) Option {
 }
 
 // New builds a Client. It returns a *ConfigError when no credential is
-// configured: an API key, a token provider, or the client credentials of
-// WithClientCredentials.
+// configured (an API key, a token provider, or the client credentials of
+// WithClientCredentials), unless WithoutCredential is given.
 func New(opts ...Option) (*Client, error) {
 	cfg := &clientConfig{
 		baseURL:   os.Getenv(EnvBaseURL),
@@ -229,10 +248,11 @@ func New(opts ...Option) (*Client, error) {
 		return nil, NewConfigError(
 			"WithClientCredentials needs both values: the client ID and the client secret")
 	}
-	if cfg.apiKey == "" && cfg.tokenProvider == nil && cfg.clientID == "" {
+	if cfg.apiKey == "" && cfg.tokenProvider == nil && cfg.clientID == "" && !cfg.credentialOptional {
 		return nil, NewConfigError(
 			"a credential is required: pass WithAPIKey (or set LUMOAUTH_API_KEY), " +
-				"WithAccessToken, WithTokenProvider, or WithClientCredentials")
+				"WithAccessToken, WithTokenProvider, or WithClientCredentials; " +
+				"pass WithoutCredential for a client that only builds addresses and calls the token endpoint")
 	}
 	return newClient(cfg), nil
 }

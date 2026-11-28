@@ -18,7 +18,8 @@ import (
 )
 
 // Web sign-in: the OAuth 2.1 Authorization Code + PKCE flow, wired into
-// any net/http-compatible router and backed by a signed session cookie.
+// any net/http-compatible router and backed by an encrypted session cookie
+// (see web_session_store.go) or a session store of your choice.
 
 // WebConfig configures NewWebAuth.
 type WebConfig struct {
@@ -39,9 +40,10 @@ type WebConfig struct {
 	// ClientSecret is required for confidential clients; omit for public
 	// ones, which rely on PKCE alone.
 	ClientSecret string
-	// SessionSecret keys the cookie store. Use at least 32 random bytes,
-	// and keep it stable across restarts or every session is invalidated.
-	// Required.
+	// SessionSecret is the secret from which the default store derives the
+	// keys that encrypt and sign the session cookie. Use at least 32 random
+	// bytes, and keep it stable across restarts or every session is
+	// invalidated. Required unless Store is set.
 	SessionSecret string
 	// CallbackPath is the absolute path LumoAuth redirects back to. It
 	// must match a redirect URI registered on the OAuth client.
@@ -53,9 +55,17 @@ type WebConfig struct {
 	// PostLoginRedirect is where users land after signing in.
 	// Defaults to "/".
 	PostLoginRedirect string
-	// PostLogoutRedirect is where users land after signing out.
-	// Defaults to "/".
+	// PostLogoutRedirect is where users land after signing out. Defaults to
+	// "/". The logout route also ends the LumoAuth session, so LumoAuth
+	// sends the browser here: a path is made absolute with the request's
+	// origin, and the absolute address must be registered on the client as
+	// a post-logout redirect URI.
 	PostLogoutRedirect string
+	// LocalLogout makes the logout route end only this app's session: the
+	// user stays signed in at LumoAuth, and the next sign-in needs no
+	// password. False (the default) also ends the LumoAuth session through
+	// the end-session endpoint (RP-initiated logout).
+	LocalLogout bool
 	// HTTPClient overrides the client used for token exchange and
 	// UserInfo. Defaults to a 10s-timeout client.
 	HTTPClient *http.Client
@@ -70,6 +80,14 @@ type WebConfig struct {
 	SessionMaxAge time.Duration
 	// SkipCertValidation disables TLS verification. Local development only.
 	SkipCertValidation bool
+	// Store replaces the session store, for example with a server-side
+	// store (gorilla's FilesystemStore, a Redis store) that keeps only an
+	// ID in the cookie. The session is named CookieName. With a Store,
+	// SessionSecret, CookieSecure and SessionMaxAge are not used: the store
+	// has its own keys and cookie options. Nil means the default store: an
+	// encrypted, signed cookie that is split over several cookies when the
+	// session does not fit in one.
+	Store sessions.Store
 }
 
 // Bool returns a pointer to b — for optional *bool fields such as
@@ -131,8 +149,8 @@ func NewWebAuth(cfg WebConfig) (*WebAuth, error) {
 	if cfg.ClientID == "" {
 		return nil, NewConfigError("ClientID is required")
 	}
-	if cfg.SessionSecret == "" {
-		return nil, NewConfigError("SessionSecret is required (use at least 32 random bytes)")
+	if cfg.SessionSecret == "" && cfg.Store == nil {
+		return nil, NewConfigError("SessionSecret is required (use at least 32 random bytes), unless Store is set")
 	}
 	if cfg.CallbackPath == "" {
 		cfg.CallbackPath = "/auth/callback"
@@ -163,13 +181,15 @@ func NewWebAuth(cfg WebConfig) (*WebAuth, error) {
 		cookieSecure = *cfg.CookieSecure
 	}
 
-	store := sessions.NewCookieStore([]byte(cfg.SessionSecret))
-	store.Options = &sessions.Options{
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   cookieSecure,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(cfg.SessionMaxAge / time.Second),
+	store := cfg.Store
+	if store == nil {
+		store = newChunkedCookieStore(cfg.SessionSecret, &sessions.Options{
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   cookieSecure,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   int(cfg.SessionMaxAge / time.Second),
+		})
 	}
 
 	client := newClient(&clientConfig{
@@ -277,7 +297,9 @@ func (w *WebAuth) LoginHandler() http.HandlerFunc { return w.handleLogin }
 // CallbackHandler completes the sign-in flow.
 func (w *WebAuth) CallbackHandler() http.HandlerFunc { return w.handleCallback }
 
-// LogoutHandler clears the session.
+// LogoutHandler ends the session: it revokes the refresh token, clears the
+// local session and, unless LocalLogout is set, sends the browser to
+// LumoAuth's end-session endpoint, which returns it to PostLogoutRedirect.
 func (w *WebAuth) LogoutHandler() http.HandlerFunc { return w.handleLogout }
 
 // ── Route handlers ────────────────────────────────────────────────────
@@ -388,27 +410,69 @@ func (w *WebAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
 func (w *WebAuth) handleLogout(rw http.ResponseWriter, req *http.Request) {
 	session := w.session(req)
 
+	var tokens SessionTokens
+	signedIn := false
+	if raw, ok := session.Values[sessionKeyTokens].(string); ok && raw != "" {
+		signedIn = json.Unmarshal([]byte(raw), &tokens) == nil
+	}
+
 	// Best-effort server-side revocation before dropping local state: a
 	// failure here must not strand the user in a session they asked to end.
-	if raw, ok := session.Values[sessionKeyTokens].(string); ok && raw != "" {
-		var tokens SessionTokens
-		if json.Unmarshal([]byte(raw), &tokens) == nil && tokens.RefreshToken != "" {
-			_ = w.client.Auth.Revoke(req.Context(), RevokeParams{
-				Token:         tokens.RefreshToken,
-				TokenTypeHint: "refresh_token",
-				ClientID:      w.cfg.ClientID,
-				ClientSecret:  w.cfg.ClientSecret,
-			})
-		}
+	if signedIn && tokens.RefreshToken != "" {
+		_ = w.client.Auth.Revoke(req.Context(), RevokeParams{
+			Token:         tokens.RefreshToken,
+			TokenTypeHint: "refresh_token",
+			ClientID:      w.cfg.ClientID,
+			ClientSecret:  w.cfg.ClientSecret,
+		})
 	}
 
 	delete(session.Values, sessionKeyUser)
 	delete(session.Values, sessionKeyTokens)
 	delete(session.Values, sessionKeyFlow)
+	if session.Options == nil {
+		session.Options = &sessions.Options{Path: "/"}
+	}
 	session.Options.MaxAge = -1 // expire the cookie
 	_ = session.Save(req, rw)
 
-	http.Redirect(rw, req, w.cfg.PostLogoutRedirect, http.StatusFound)
+	// End the LumoAuth session too, or the next sign-in needs no password.
+	// A visitor who was not signed in has nothing to end there.
+	if w.cfg.LocalLogout || !signedIn {
+		http.Redirect(rw, req, w.cfg.PostLogoutRedirect, http.StatusFound)
+		return
+	}
+	endSession, err := w.client.Auth.EndSessionURL(EndSessionURLParams{
+		// With the hint LumoAuth ends the session at once and redirects;
+		// without one (a session without the openid scope) the user
+		// confirms the sign-out on LumoAuth's page.
+		IDTokenHint:           tokens.IDToken,
+		PostLogoutRedirectURI: w.postLogoutRedirectURI(req),
+	})
+	if err != nil {
+		http.Redirect(rw, req, w.cfg.PostLogoutRedirect, http.StatusFound)
+		return
+	}
+	http.Redirect(rw, req, endSession, http.StatusFound)
+}
+
+// postLogoutRedirectURI is PostLogoutRedirect as an absolute URL: as
+// configured when it is one, otherwise resolved against this request's
+// origin (honouring the proxy's forwarding headers, as the callback does).
+// LumoAuth accepts only an absolute, registered address.
+func (w *WebAuth) postLogoutRedirectURI(req *http.Request) string {
+	target, err := url.Parse(w.cfg.PostLogoutRedirect)
+	if err != nil {
+		return ""
+	}
+	if target.IsAbs() {
+		return target.String()
+	}
+	base, err := url.Parse(absoluteURL(req, "/"))
+	if err != nil {
+		return ""
+	}
+	return base.ResolveReference(target).String()
 }
 
 // ── Middleware ────────────────────────────────────────────────────────

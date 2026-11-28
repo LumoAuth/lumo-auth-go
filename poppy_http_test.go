@@ -308,14 +308,19 @@ func TestWritePoppyRefusalNeedsARefusal(t *testing.T) {
 
 // ── The call failed ───────────────────────────────────────────────────
 
-const poppyFailureBody = `{"error":"server_error"}`
+const poppyFailureBody = `{"error":"temporarily_unavailable","error_description":"Requests from personal agents cannot be verified right now."}`
 
 // assertPoppyFailure checks the answer for a failed verification call:
-// 500, the fixed body, and nothing of LumoAuth's answer.
+// 503 (never 500), the fixed body, and nothing of LumoAuth's answer. The
+// cause is about this service (the protocol switched off, its credential,
+// LumoAuth out of reach), so the personal agent gets "not available now".
 func assertPoppyFailure(t *testing.T, resp *http.Response, body string, leaks ...string) {
 	t.Helper()
-	if resp.StatusCode != http.StatusInternalServerError || body != poppyFailureBody {
-		t.Errorf("response = %d %q, want 500 %s", resp.StatusCode, body, poppyFailureBody)
+	if resp.StatusCode != http.StatusServiceUnavailable || body != poppyFailureBody {
+		t.Errorf("response = %d %q, want 503 %s", resp.StatusCode, body, poppyFailureBody)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q", got)
 	}
 	if got := resp.Header.Get("Content-Type"); got != "application/json" {
 		t.Errorf("Content-Type = %q", got)

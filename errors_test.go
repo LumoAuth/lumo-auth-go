@@ -1,8 +1,10 @@
 package lumoauth
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -127,5 +129,60 @@ func TestErrorsImplementErrorInterface(t *testing.T) {
 
 	if got := NewConfigError("missing base URL").Error(); got != "missing base URL" {
 		t.Errorf("Error() = %q, want the message", got)
+	}
+}
+
+func TestBudgetExceededResponseIsABudgetAndARateLimitError(t *testing.T) {
+	// The server's refusal for a spent agent budget
+	// (AgentBudgetExceededException): 429, Retry-After, body code
+	// budget_exceeded.
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error": "budget_exceeded", "error_description": "Agent budget exceeded",
+		})
+	})
+	_, err := client.Agents.Ask(context.Background(), "reports:read", nil)
+
+	if !errors.Is(err, ErrBudgetExceeded) {
+		t.Errorf("errors.Is(err, ErrBudgetExceeded) = false for %v", err)
+	}
+	// Code written for v1.7.0 caught it as a rate limit; it still does.
+	if !errors.Is(err, ErrRateLimited) || !errors.Is(err, ErrAPI) || !errors.Is(err, ErrLumoAuth) {
+		t.Errorf("the budget error must still match ErrRateLimited, ErrAPI and ErrLumoAuth: %v", err)
+	}
+	var budgetErr *BudgetError
+	if !errors.As(err, &budgetErr) {
+		t.Fatalf("errors.As(err, *BudgetError) = false")
+	}
+	if budgetErr.RetryAfter != 120*time.Second || budgetErr.Code != CodeBudgetExceeded {
+		t.Errorf("BudgetError = %+v", budgetErr)
+	}
+	if budgetErr.Error() != "Agent budget exceeded" {
+		t.Errorf("message = %q", budgetErr.Error())
+	}
+	apiErr, ok := err.(*APIError) // the type stays *APIError, as in v1.7.0
+	if !ok || apiErr.StatusCode != 429 || apiErr.RetryAfter != 120*time.Second || apiErr.Code != "budget_exceeded" {
+		t.Errorf("APIError = %+v (ok %v)", apiErr, ok)
+	}
+}
+
+func TestOtherRateLimitsAreNoBudgetError(t *testing.T) {
+	for _, body := range []map[string]any{
+		{"error": "rate_limited"},
+		{"error": "rate_limit_exceeded", "error_description": "Too many attestation attempts; retry later."},
+		nil,
+	} {
+		client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusTooManyRequests, body)
+		})
+		_, err := client.Agents.Ask(context.Background(), "reports:read", nil)
+		if !errors.Is(err, ErrRateLimited) || errors.Is(err, ErrBudgetExceeded) {
+			t.Errorf("body %v: want a plain rate limit error, got %v", body, err)
+		}
+		var budgetErr *BudgetError
+		if errors.As(err, &budgetErr) {
+			t.Errorf("body %v: unexpected *BudgetError", body)
+		}
 	}
 }

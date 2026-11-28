@@ -6,17 +6,21 @@ package lumoauth
 //     names ignored);
 //  2. every contract route in a namespace this SDK claims (features.json)
 //     is in Routes, unless listed in known_missing_routes with a reason;
-//  3. every error code in errors.json is one of the Code* constants.
+//  3. every error code in errors.json is one of the Code* constants;
+//  4. a body code of body_code_map gives its class and its parents.
 //
 // Skips when the contract is not checked out next to sdk-go
 // (LUMO_SDK_CONTRACT overrides).
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"testing"
+	"time"
 )
 
 type contractRoute struct {
@@ -162,5 +166,80 @@ func TestContractTokenTypes(t *testing.T) {
 	}
 	if len(constants) != len(contract.Types) {
 		t.Errorf("resource_auth.go defines %d token types, the contract %d", len(constants), len(contract.Types))
+	}
+}
+
+// TestContractBodyCodeMap: a response whose body code is a key of
+// body_code_map raises that class, which still is every one of its parents
+// (errors.json body_code_semantics). In Go "is" means errors.Is with the
+// sentinel of each class in the chain, and errors.As finds the class's type.
+func TestContractBodyCodeMap(t *testing.T) {
+	dir := contractDir(t)
+	var contract struct {
+		BodyCodeMap map[string]string `json:"body_code_map"`
+		BodyFields  struct {
+			Code []string `json:"code"`
+		} `json:"api_error_body_fields"`
+		Errors []struct {
+			Name   string `json:"name"`
+			Parent string `json:"parent"`
+			Status *int   `json:"status"`
+			Go     string `json:"go"`
+		} `json:"errors"`
+	}
+	loadContract(t, dir, "errors.json", &contract)
+	if len(contract.BodyCodeMap) == 0 {
+		t.Fatal("errors.json has no body_code_map")
+	}
+
+	sentinels := map[string]error{
+		"LumoAuthError":                 ErrLumoAuth,
+		"LumoAuthApiError":              ErrAPI,
+		"LumoAuthAuthenticationError":   ErrAuthentication,
+		"LumoAuthPermissionDeniedError": ErrPermissionDenied,
+		"LumoAuthNotFoundError":         ErrNotFound,
+		"LumoAuthRateLimitError":        ErrRateLimited,
+		"LumoAuthBudgetExceededError":   ErrBudgetExceeded,
+	}
+	classes := map[string]int{}
+	for i, e := range contract.Errors {
+		classes[e.Name] = i
+	}
+
+	for bodyCode, class := range contract.BodyCodeMap {
+		i, ok := classes[class]
+		if !ok {
+			t.Errorf("body_code_map names %s, which errors.json does not define", class)
+			continue
+		}
+		status := 400
+		if contract.Errors[i].Status != nil {
+			status = *contract.Errors[i].Status
+		}
+		// The code may arrive in any of the body fields that the contract lists.
+		for _, field := range contract.BodyFields.Code {
+			body, _ := json.Marshal(map[string]any{field: bodyCode, "error_description": "refused"})
+			resp := &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {"7"}}}
+			err := error(apiErrorFromResponse(resp, body))
+
+			for c := class; c != ""; {
+				j := classes[c]
+				if sentinel, ok := sentinels[c]; ok && !errors.Is(err, sentinel) {
+					t.Errorf("%s in %q: the error does not match the sentinel of %s", bodyCode, field, c)
+				}
+				c = contract.Errors[j].Parent
+			}
+			switch contract.Errors[i].Go {
+			case "BudgetError":
+				var typed *BudgetError
+				if !errors.As(err, &typed) {
+					t.Errorf("%s in %q: errors.As(*BudgetError) = false", bodyCode, field)
+				} else if typed.RetryAfter != 7*time.Second {
+					t.Errorf("%s in %q: RetryAfter = %v, want 7s", bodyCode, field, typed.RetryAfter)
+				}
+			default:
+				t.Errorf("%s: no errors.As check for the Go type %q; add one", class, contract.Errors[i].Go)
+			}
+		}
 	}
 }

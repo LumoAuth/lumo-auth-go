@@ -36,6 +36,7 @@ The SDK has the same namespaces and the same error codes as the [JS](../sdk-js) 
   - [Just-in-Time permissions](#just-in-time-permissions)
   - [Act on behalf of a user (delegation)](#act-on-behalf-of-a-user-delegation)
   - [Get a token for an MCP server](#get-a-token-for-an-mcp-server)
+  - [Sign in with the workload's identity: attestation](#sign-in-with-the-workloads-identity-attestation)
   - [Bind tokens to a key with DPoP](#bind-tokens-to-a-key-with-dpop)
   - [Verify LumoAuth tokens in your MCP server](#verify-lumoauth-tokens-in-your-mcp-server)
   - [Check access to an MCP tool](#check-access-to-an-mcp-tool)
@@ -211,7 +212,7 @@ Every constructor and helper that addresses LumoAuth takes the option:
 | --- | --- |
 | `lumoauth.New` | `WithCustomDomain(domain)`, or `LUMOAUTH_CUSTOM_DOMAIN` |
 | `NewAgent`, `NewWebAuth`, `NewAAuthClient` | The `CustomDomain` field of the config struct, or `LUMOAUTH_CUSTOM_DOMAIN` |
-| `NewJITContext`, `NewDelegationChain` | Nothing: they follow the agent that you pass |
+| `NewJITContext`, `NewDelegationChainForApplication`, `NewDelegationChain` | Nothing: they follow the agent that you pass |
 | `VerifyAccessToken`, `RequireAccessToken` | `AccessTokenVerifyOptions.CustomDomain`, in place of `Issuer` |
 | `VerifyAuthToken` | `VerifyOptions.CustomDomain` |
 | Key caches | `NewAccessTokenKeyCacheForCustomDomain`, `NewJWKSCacheForCustomDomain` |
@@ -232,7 +233,7 @@ Three details matter when you build requests yourself:
   from `APIConfig` then removes the segment. Without the organization ID, the generated
   client cannot reach a custom domain.
 - A `TokenSource` of your own that uses a custom domain must have the method
-  `CustomDomain() string`, as `*Agent` has. `NewJITContext` and `NewDelegationChain` read it.
+  `CustomDomain() string`, as `*Agent` has. `NewJITContext` and the delegation chain constructors read it.
 
 #### AAuth on a custom domain
 
@@ -311,10 +312,28 @@ the token lacks a scope, the server answers 403. The error lists the missing sco
 | `WithUserAgent(ua)` | The `User-Agent` header | `lumoauth-go/` followed by the SDK's version |
 | `WithSkipCertValidation()` | Turns off TLS verification. Use it for local development only. | off |
 | `WithDPoP(signer)` | Binds every token the client obtains to a DPoP key, and presents bound tokens with the `DPoP` scheme. See [DPoP](#bind-tokens-to-a-key-with-dpop). | off |
+| `WithoutCredential()` | Lets `New` build a client without a credential, for addresses and the calls that authenticate themselves | off |
 
 `New` returns a `ConfigError` when no credential is configured. It needs an API key, an
-access token, a token provider or client credentials. A client that has only client
-credentials can call `client.Poppy` and nothing else.
+access token, a token provider or client credentials, unless you pass `WithoutCredential()`.
+A client that has only client credentials can call `client.Poppy` and nothing else.
+
+A client built with `WithoutCredential()` builds addresses (`Auth.AuthorizationURL`,
+`Auth.EndSessionURL`, `Issuer`, `OrgPath`) and makes the calls that carry their own
+authentication: the token endpoint calls of `client.Auth` (code exchange, refresh, client
+credentials with a secret or a client assertion, token exchange with client authentication),
+`Auth.Revoke`, `Auth.UserInfo` with a token, and `Agents.Attest`. A call that needs a credential
+is sent without one, and the server's 401 matches `ErrAuthentication`. An API key from
+`LUMOAUTH_API_KEY` is still used when it is set.
+
+```go
+// A sign-in that only needs addresses and the token endpoint.
+client, err := lumoauth.New(lumoauth.WithOrgID("acme-corp"), lumoauth.WithoutCredential())
+authorizeURL, err := client.Auth.AuthorizationURL(lumoauth.AuthorizationURLParams{
+    ClientID: clientID, RedirectURI: "https://app.example.com/callback", State: state,
+    CodeChallenge: challenge,
+})
+```
 
 ### Environment variables
 
@@ -448,6 +467,10 @@ if err != nil {
 fmt.Println(decision.Allowed, decision.Reason, decision.MatchedPolicies)
 ```
 
+Each entry of `MatchedPolicies` has the policy's `ID` as text (the server sends a number, so
+policy 81 gives `"81"`) and its `Name`. A caller with the `policies.view` permission also gets
+`Effect` and `Priority`; the full policy is in `decision.Raw`.
+
 The SDK sends `Context` as the request's `environment` object, which the policy engine reads.
 LumoAuth sets the keys `ip`, `userAgent`, `requestMethod` and `requestPath` from the request
 that it received. If you send values under those names, the server moves them under `pep`.
@@ -482,8 +505,8 @@ err = client.Abac.SetResourceAttribute(ctx, "document", "doc-123", "classificati
 
 ### Sign users in
 
-`WebAuth` runs the OAuth 2.1 authorization code flow with PKCE. It stores the session in a
-signed cookie.
+`WebAuth` runs the OAuth 2.1 authorization code flow with PKCE. It stores the session in an
+encrypted cookie (see [The session cookie](#the-session-cookie)).
 
 ```go
 auth, err := lumoauth.NewWebAuth(lumoauth.WebConfig{
@@ -518,8 +541,13 @@ The router handles three paths:
   after sign-in. Only paths on your own site are accepted, so the parameter cannot be used as an
   open redirect.
 - `/auth/callback` exchanges the code for tokens and stores the session.
-- `/auth/logout` revokes the refresh token, clears the session and redirects to
-  `PostLogoutRedirect`.
+- `/auth/logout` revokes the refresh token, clears the session and ends the LumoAuth session
+  too: it sends the browser to the organization's end-session endpoint with the session's ID
+  token (`id_token_hint`), and LumoAuth sends it on to `PostLogoutRedirect`. Register the
+  absolute address of `PostLogoutRedirect` (for example `https://app.example.com/`) on the OAuth
+  client as a post-logout redirect URI; a path is made absolute with the request's origin.
+  Without that registration, the user lands on LumoAuth's own sign-out page. Set
+  `LocalLogout: true` to end only your app's session.
 
 `Router()` returns a plain `http.Handler`, so you can mount it in chi, gorilla/mux or
 `net/http`. To mount the handlers one by one, use `LoginHandler`, `CallbackHandler` and
@@ -534,15 +562,17 @@ The router handles three paths:
 | `CustomDomain` | The organization's own domain. The sign-in, token and UserInfo addresses are then on that domain. | `$LUMOAUTH_CUSTOM_DOMAIN` |
 | `ClientID` | The OAuth client of your app (required) | none |
 | `ClientSecret` | Required for confidential clients. Public clients use PKCE alone. | none |
-| `SessionSecret` | The key of the cookie store (required). Keep it the same across restarts, or every session ends. | none |
+| `SessionSecret` | The secret from which the session cookie's encryption and signing keys are derived. Required unless `Store` is set. Keep it the same across restarts, or every session ends. | none |
 | `CallbackPath` | The callback path. It must match a registered redirect URI. | `/auth/callback` |
 | `Scope` | The scopes to request, separated by spaces | `openid profile email` |
-| `PostLoginRedirect`, `PostLogoutRedirect` | The pages that users go to after sign-in and sign-out | `/` |
+| `PostLoginRedirect`, `PostLogoutRedirect` | The pages that users go to after sign-in and sign-out. Register the absolute address of `PostLogoutRedirect` as a post-logout redirect URI. | `/` |
+| `LocalLogout` | `/auth/logout` ends only your app's session and leaves the user signed in at LumoAuth | off |
 | `CookieName` | The name of the session cookie | `lumo_session` |
 | `CookieSecure` | The `Secure` flag of the cookie. `nil` means true. | true |
 | `SessionMaxAge` | The longest lifetime of the session cookie | 30 days |
 | `HTTPClient` | The client for the token and UserInfo calls | a client with a 10-second timeout |
 | `SkipCertValidation` | Turns off TLS verification. Use it for local development only. | off |
+| `Store` | Another `sessions.Store` (gorilla/sessions), for example a server-side store. With a `Store`, `SessionSecret`, `CookieSecure` and `SessionMaxAge` are not used. | the encrypted cookie |
 
 Add scopes to `Scope` for the calls that your app makes as the user. Add `authz:read` when the
 app lists the user's permissions or reads roles from `Agents.Me`. Add `abac:read` when it runs
@@ -550,6 +580,39 @@ ABAC checks as the user. For example: `Scope: "openid profile email authz:read"`
 
 Session cookies are `HttpOnly`, `SameSite=Lax` and `Secure`. For local development over plain
 HTTP, set `CookieSecure: lumoauth.Bool(false)`.
+
+#### The session cookie
+
+The session holds the user's profile, the access token, the refresh token and the ID token.
+`/auth/logout` needs the ID token to end the LumoAuth session. The cookie is encrypted with
+AES-256 and signed with HMAC-SHA256 (gorilla/securecookie). Both keys are derived from
+`SessionSecret`, so a person who holds the cookie cannot read the tokens or change them.
+
+A browser keeps at most 4,096 bytes per cookie. With the default scopes the session is about
+4,300 bytes, so the SDK splits it: the first part goes in `lumo_session`, the next parts in
+`lumo_session.1`, `lumo_session.2`, and so on. Every save expires the parts that the session no
+longer needs. A session that needs more than eight parts is refused with a `ConfigError`; use a
+server-side store for it.
+
+To keep the session on the server and only its ID in the cookie, pass a store:
+
+```go
+store := sessions.NewFilesystemStore("/var/lib/myapp/sessions",
+    []byte(os.Getenv("SESSION_AUTH_KEY")),       // 32 or 64 random bytes
+    []byte(os.Getenv("SESSION_ENCRYPTION_KEY"))) // 32 random bytes
+store.Options = &sessions.Options{Path: "/", HttpOnly: true, Secure: true,
+    SameSite: http.SameSiteLaxMode, MaxAge: 30 * 24 * 3600}
+store.MaxLength(0) // the store keeps the data in a file, not in the cookie
+
+auth, err := lumoauth.NewWebAuth(lumoauth.WebConfig{
+    ClientID: os.Getenv("LUMO_CLIENT_ID"), ClientSecret: os.Getenv("LUMO_CLIENT_SECRET"),
+    Store:    store, // a Redis or database store works the same way
+})
+```
+
+Sessions written by v1.7.0 and earlier (a signed cookie without encryption) are still read with
+the same `SessionSecret`, so an upgrade signs nobody out. The next save writes the encrypted
+form.
 
 ### Protect `net/http` routes
 
@@ -615,8 +678,32 @@ err = client.Auth.Revoke(ctx, lumoauth.RevokeParams{
     ClientID: clientID, ClientSecret: clientSecret,
 })
 
+// 4. Sign out of LumoAuth too: clear your session, then send the browser here.
+logout, err := client.Auth.EndSessionURL(lumoauth.EndSessionURLParams{
+    IDTokenHint:           tokens.IDToken,
+    PostLogoutRedirectURI: "https://app.example.com/", // registered on the client
+})
+
 // Machine-to-machine: the client credentials grant.
 m2m, err := client.Auth.ClientCredentials(ctx, clientID, clientSecret, "reports:read")
+
+// Exchange a user's token for one that your API accepts (RFC 8693). A confidential
+// application authenticates: with its secret (Basic by default, or
+// ClientAuthMethod: lumoauth.ClientSecretPost) or with ClientAssertion (private_key_jwt).
+// Token exchange must be switched on for the application.
+apiToken, err := client.Auth.TokenExchange(ctx, lumoauth.TokenExchangeParams{
+    SubjectToken: tokens.AccessToken,
+    Resource:     "https://api.example.com/orders",
+    ClientID:     clientID,
+    ClientSecret: clientSecret,
+})
+
+// The same grant for one API: the token's aud is the resource, not the client ID.
+forAPI, err := client.Auth.ClientCredentialsWithParams(ctx, lumoauth.ClientCredentialsParams{
+    ClientID: clientID, ClientSecret: clientSecret,
+    Scopes:   []string{"reports:read"},
+    Resource: "https://api.example.com/",
+})
 ```
 
 Set `AccessType: "offline"` on `AuthorizationURLParams` to ask for a refresh token.
@@ -654,8 +741,11 @@ if !result.Allowed {
 }
 ```
 
-`AgentAskResult` holds `Allowed`, `Reason`, `AuditID` and the `Context` that the server
-evaluated. As with ABAC, the server sets `ip`, `userAgent`, `requestMethod` and `requestPath`
+`AgentAskResult` holds `Allowed`, `Reason`, `DecidedBy`, `AuditID` and the `Context` that the
+server evaluated. `DecidedBy` names the check that produced the answer:
+`lumoauth.DecidedByCapability` (the agent's capabilities), `DecidedByPDP` (your policies and
+relationships) or `DecidedByDenyOverride` (an attribute policy denied what a capability
+allowed). As with ABAC, the server sets `ip`, `userAgent`, `requestMethod` and `requestPath`
 itself and moves your values under `pep`.
 
 Check capabilities and the budget:
@@ -668,7 +758,7 @@ if err := agent.RequireCapability(ctx, "web:search"); err != nil {
     return err
 }
 
-// Returns an error that matches ErrBudgetExceeded when the daily token budget is used up.
+// Returns an error that matches ErrBudgetExceeded when any limit of the budget is reached.
 if err := agent.CheckBudget(ctx); err != nil {
     return err
 }
@@ -678,9 +768,23 @@ if err := agent.CheckBudget(ctx); err != nil {
 _, err = agent.ReportUsage(ctx, resp.Usage.TotalTokens, 0.0042)
 
 caps, err := agent.Capabilities(ctx)      // []string
-budget, err := agent.Budget(ctx)          // MaxTokensPerDay, TokensUsedToday, ReportedExhausted
+budget, err := agent.Budget(ctx)          // limits, usage and the server's verdict, see below
 me, err := agent.Identity(ctx, false)     // identity, capabilities, workspace (cached)
 ```
+
+`AgentBudget` types every key of the `budget_policy` that UserInfo and `ReportUsage` return.
+A limit that is not set is 0:
+
+| Limits | Usage in the current UTC window |
+| --- | --- |
+| `MaxAPICallsPerHour`, `MaxAPICallsPerDay` | `APICallsThisHour`, `APICallsToday` |
+| `MaxTokensPerHour`, `MaxTokensPerDay` | `TokensUsedThisHour`, `TokensUsedToday` |
+| `MaxCostPerDayUSD`, `HardLimitUSD` (both daily) | `CostTodayUSD` |
+| `MaxCostPerMonthUSD` | `CostThisMonthUSD` |
+
+`ReportedExhausted` is the server's verdict, and `budget.Exhausted()` uses it. `MaxSteps` and
+`TimeoutSeconds` are settings that LumoAuth stores but does not enforce: your agent applies
+them. `budget.Raw` holds the whole object.
 
 The `Agent` has the namespaces `Agents`, `Jit`, `Delegation`, `Approvals`, `Mcp` and
 `Permissions`. `agent.Client()` returns the underlying `*Client` for the rest.
@@ -821,31 +925,56 @@ with the `jit:approve` scope. An agent's own token cannot call it.
 ### Act on behalf of a user (delegation)
 
 With delegation, an agent can call APIs as "agent X acting for user Y". It uses OAuth token
-exchange (RFC 8693). `DelegationChain` manages the whole flow for one session ID per user.
+exchange (RFC 8693). An agent never starts a sign-in: the person signs in to an **application**
+of your organization, the application redeems the code, and the agent exchanges the person's
+access token. `DelegationChain` manages the whole flow for one session ID per user.
 
 ```go
-chain := lumoauth.NewDelegationChain(agent, "https://agent.example.com/callback")
+chain, err := lumoauth.NewDelegationChainForApplication(agent, lumoauth.DelegationApplication{
+    ClientID:      os.Getenv("APP_CLIENT_ID"),     // the application, never the agent's agt_… ID
+    ClientSecret:  os.Getenv("APP_CLIENT_SECRET"), // empty for a public application
+    RedirectURI:   "https://app.example.com/agent/callback", // registered on the application
+    OfflineAccess: true, // a refresh token: to renew the person's token and to revoke
+})
 
-// 1. Send the user to the consent page.
+// 1. Send the person to sign in to the application. The URL asks for openid, the scopes and
+//    offline_access, with a PKCE S256 challenge that the chain keeps.
 consentURL, err := chain.ConsentURL("session-1", []string{"documents:read"}, "")
 
-// 2. Your callback receives ?code=...
+// 2. Your callback receives ?code=…&state=…. Compare the state with chain.ConsentState, then
+//    let the application redeem the code (its client ID, its secret and the PKCE verifier).
 err = chain.HandleConsentCallback(ctx, "session-1", code)
 
 // 3. Call an API as the agent acting for the user. The exchange happens when needed.
 var out map[string]any
 err = chain.Do(ctx, "session-1", http.MethodGet, "/orgs/acme-corp/api/v1/documents", nil, &out)
 
-// Hand the delegation to a sub-agent. A chain is at most 3 agents deep.
+// Hand the delegation to a sub-agent. A chain holds at most 5 actors (MaxDelegationDepth).
 subToken, err := chain.DelegateToSubAgent(ctx, "session-1", subAgentToken, "documents:read")
 
-// End the delegation. This revokes the refresh token and every token made from it.
+// End the delegation: the application revokes the person's refresh token, which ends every
+// delegated token of that grant.
 err = chain.Revoke(ctx, "session-1")
 ```
 
-If you already hold the user's access token, call `chain.SetUserToken(sessionID, token)` and
-skip the consent step. Without a refresh token, the delegation lasts only as long as that
-token does.
+The scopes must be allowed for the application and held by the agent as capabilities: the
+delegated token gets what the agent asks for, the agent's capabilities and the person's token
+have in common. The agent also needs **May act on behalf of users**.
+
+If your application signs the person in itself, register its tokens with
+`chain.SetUserTokens(sessionID, tokenResponse)` and skip the consent step. With the refresh
+token, the chain renews the person's token as the application and `Revoke` ends the grant.
+`chain.SetUserToken(sessionID, accessToken)` takes an access token alone: the delegation then
+lasts as long as that token, and `Revoke` can only forget the session. `Revoke` then returns
+an error that matches `lumoauth.ErrDelegationNotRevoked`, because the grant at LumoAuth still
+stands; revoke the person's refresh token where it is held, with `client.Auth.Revoke` and the
+application's credentials. `chain.Forget(sessionID)` drops a session without any request.
+
+`NewDelegationChain(agent, redirectURI)` is deprecated: its consent flow used the agent's
+client ID, which LumoAuth refuses ("Unknown Application"). With an agent's `agt_…` ID its
+`ConsentURL` and `HandleConsentCallback` return a `ConfigError`. Its exchange and
+`SetUserToken` keep working. For your own flow, `client.Delegation.ApplicationConsentURL`
+builds the same URL as `ConsentURL` from explicit parameters.
 
 **Bind the token to an API.** Pass the URL of the API that will receive the token as an
 RFC 8707 resource indicator. It becomes the token's `aud` claim. Without it, the delegated
@@ -931,7 +1060,41 @@ Every token request carries a new assertion: `iss` and `sub` are the agent ID, `
 organization's issuer identifier, `exp` is 60 seconds ahead and `jti` is random. The signer
 works with ECDSA (P-256, P-384, P-521), Ed25519 and RSA keys, and RSA keys can use PS256 to
 PS512 through `ClientAssertionOptions.Algorithm`. `Auth.ClientCredentialsWithAssertion` sends
-an assertion on a plain client.
+an assertion on a plain client. An application that holds only its private key builds that
+client with `WithoutCredential()`:
+
+```go
+client, err := lumoauth.New(lumoauth.WithOrgID("acme-corp"), lumoauth.WithoutCredential())
+issuer, err := client.Issuer() // the assertion's aud
+assertion, err := signer.Assertion(clientID, issuer)
+token, err := client.Auth.ClientCredentialsWithAssertion(ctx, clientID, assertion)
+```
+
+### Sign in with the workload's identity: attestation
+
+An agent that runs on a platform which issues OIDC tokens (GitHub Actions, Kubernetes, AWS,
+Google Cloud, Azure, SPIFFE) needs no secret at all. Register the agent with the **Workload**
+identity type and its binding, then trade the platform's token for an agent access token:
+
+```go
+token, err := os.ReadFile("/var/run/secrets/tokens/lumoauth") // the platform's OIDC token
+result, err := lumoauth.AttestWorkload(ctx, lumoauth.AttestWorkloadOptions{
+    AgentID:          "agt_7f3c2a19b84e5d60",
+    AttestationToken: strings.TrimSpace(string(token)),
+    Scopes:           []string{"reports:read"}, // optional: some of the agent's capabilities
+})
+if err != nil {
+    return err // a rejected token matches ErrAuthentication (401 attestation_rejected)
+}
+client, err := lumoauth.New(lumoauth.WithAccessToken(result.AccessToken))
+```
+
+`AttestWorkload` needs no LumoAuth credential: it reads the address from its options or from
+`LUMOAUTH_URL`, `LUMOAUTH_ORG_ID` and `LUMOAUTH_CUSTOM_DOMAIN`, and it never sends an API key.
+`client.Agents.Attest(ctx, params)` does the same with an existing client. The token lives 15
+minutes (`result.ExpiresIn`); attest again for a new one. `result.Identity` holds the provider,
+subject and issuer that LumoAuth verified. Set `DPoP` (or `WithDPoP` on the client) to bind the
+token to a key: the request then carries a proof and `result.TokenType` is `DPoP`.
 
 ### Bind tokens to a key with DPoP
 
@@ -1008,6 +1171,20 @@ also checks the DPoP proof: the `DPoP` scheme, the proof signature, `htm` and `h
 `iat` window, `ath`, the key thumbprint, and that the proof's `jti` was not seen before.
 `RequireDPoP: true` refuses tokens that are not bound. A rejection is a `ValidationError`
 whose `Reason` is one of the `TokenRejected*` constants; `RejectionReason(err)` reads it.
+
+A server that issues DPoP nonces (RFC 9449 §9) sets the nonce it expects. With
+`RequireAccessToken`, `DPoPNonce` returns it for each request; a proof without it gets 401 with
+`error="use_dpop_nonce"` and the nonce in a `DPoP-Nonce` header, so the client can sign a new
+proof. With `VerifyAccessToken`, set `DPoPRequest.Nonce`; the rejection reason is then
+`TokenRejectedDPoPNonce`.
+
+```go
+protect := lumoauth.RequireAccessToken(lumoauth.AccessTokenVerifyOptions{
+    Issuer:    issuer,
+    Resource:  resource,
+    DPoPNonce: func(*http.Request) string { return nonces.Current() }, // your own rotation
+})
+```
 
 The keys come from `{issuer}/.well-known/openid-configuration` and are cached per issuer,
 with one refetch when a token names an unknown `kid`. Pass `JWKS` to supply them yourself,
@@ -1141,7 +1318,7 @@ func main() {
             RequiredScope: scopes,
             OnError: func(w http.ResponseWriter, r *http.Request, err error) {
                 log.Printf("Session verification failed: %v", err)
-                http.Error(w, "internal error", http.StatusInternalServerError)
+                http.Error(w, "not available now", http.StatusServiceUnavailable)
             },
         })
         if err != nil {
@@ -1180,8 +1357,11 @@ For each request, the middleware does one of three things:
   every header and the body. It does not call the handler.
 - **The call failed.** The SDK could not reach LumoAuth, or LumoAuth rejected your
   application (401, 403, 404 or 429). The middleware does not call the handler and relays
-  nothing. It calls `OnError`. Without `OnError` it answers `500` with the fixed body
-  `{"error":"server_error"}`. The error text never reaches the personal agent.
+  nothing. It calls `OnError`. Without `OnError` it answers `503` with the fixed body
+  `{"error":"temporarily_unavailable","error_description":"Requests from personal agents cannot be verified right now."}`.
+  The error text never reaches the personal agent. While the organization has the protocol
+  switched off, LumoAuth answers your call with `404 not_found`, so the error matches
+  `ErrNotFound`.
 
 The SDK does not log. Set `OnError` to record the error, as the example does. Never write
 the error to the response: it is about your service, not about the personal agent.
@@ -1219,7 +1399,7 @@ func returnOrder(w http.ResponseWriter, r *http.Request) {
         &lumoauth.PoppyVerifyOptions{RequiredScope: []string{"orders:write"}})
     if err != nil {
         log.Printf("Session verification failed: %v", err)
-        http.Error(w, "internal error", http.StatusInternalServerError)
+        http.Error(w, "not available now", http.StatusServiceUnavailable)
         return
     }
     if !verification.Active {
@@ -1499,6 +1679,12 @@ case errors.Is(err, lumoauth.ErrPermissionDenied):
         // The token lacks a scope. Ask the user to sign in again with these scopes.
         log.Printf("missing scopes: %v", apiErr.RequiredScopes)
     }
+case errors.Is(err, lumoauth.ErrBudgetExceeded):
+    // The agent's budget is spent. It is a rate limit too, so check it first.
+    var budgetErr *lumoauth.BudgetError
+    if errors.As(err, &budgetErr) {
+        log.Printf("budget spent, the window starts again in %s", budgetErr.RetryAfter)
+    }
 case errors.Is(err, lumoauth.ErrRateLimited):
     var apiErr *lumoauth.APIError
     if errors.As(err, &apiErr) {
@@ -1525,7 +1711,7 @@ case err != nil:
 | `ErrApprovalDenied` | A person declined an approval | `APPROVAL_DENIED` |
 | `ErrApprovalTimeout` | An approval expired before anyone answered | `APPROVAL_TIMEOUT` |
 | `ErrApprovalNotDelivered` | No push device got the approval request; see `ApprovalError.Reason` | `APPROVAL_NOT_DELIVERED` |
-| `ErrBudgetExceeded` | The agent's daily budget is used up | `BUDGET_EXCEEDED` |
+| `ErrBudgetExceeded` | The agent's budget is spent: a 429 with the body code `budget_exceeded`, or `CheckBudget` | `budget_exceeded` from the server, `BUDGET_EXCEEDED` from `CheckBudget` |
 
 `*APIError` has these fields:
 
@@ -1538,6 +1724,12 @@ case err != nil:
 
 When a token lacks a scope, the server's error code is `forbidden`, so `ErrorCode(err)` returns
 `forbidden`. `errors.Is(err, lumoauth.ErrPermissionDenied)` still matches.
+
+When the server refuses a call because the agent's budget is spent, it answers 429 with the body
+code `budget_exceeded`. The error is an `*APIError` that matches both `ErrRateLimited` and
+`ErrBudgetExceeded`, and `errors.As` finds a `*BudgetError` in it, with the same `RetryAfter`.
+Code that handles the rate limit keeps working. `Agent.CheckBudget` returns a `*BudgetError` too,
+without a request; its `Budget` field holds the budget that it checked.
 
 The helpers `AsAPIError(err)`, `StatusCode(err)` and `ErrorCode(err)` read these values
 without `errors.As`. Errors wrap their causes, so `errors.Is(err, context.DeadlineExceeded)`
@@ -1594,8 +1786,10 @@ API keys are not accepted on ABAC routes.
 | `ExchangeCode(ctx, params)` | Trades an authorization code for tokens |
 | `RefreshToken(ctx, params)` | Gets a new access token with a refresh token |
 | `ClientCredentials(ctx, id, secret, scopes...)` | The machine-to-machine grant |
+| `ClientCredentialsWithParams(ctx, params)` | The same grant with a secret or an assertion, and a `Resource` (RFC 8707) for the token's audience |
 | `TokenExchange(ctx, params)` | RFC 8693 token exchange |
 | `Revoke(ctx, params)` | Revokes an access or refresh token |
+| `EndSessionURL(params)` | Builds the end-session (RP-initiated logout) URL |
 | `UserInfo(ctx, accessToken)` | The OpenID Connect UserInfo claims |
 
 ### `client.Agents` and `Agent`
@@ -1609,6 +1803,7 @@ API keys are not accepted on ABAC routes.
 | `Agent.RequireCapability`, `HasCapability`, `CheckBudget` | Guards that return errors | agent credential |
 | `Agent.MCPToken(ctx, serverID)` | A token for an MCP server | agent credential |
 | `AuthorizeMcpTool(ctx, serverID, tool)`, `Agent.AuthorizeMcpTool` | May the agent run this MCP tool? A deny returns `Allowed` false | agent credential |
+| `Attest(ctx, params)`, `lumoauth.AttestWorkload(ctx, opts)` | Trades a workload's OIDC token for an agent access token | none: the workload's token is the credential |
 
 ### `client.Approvals`
 
@@ -1636,10 +1831,12 @@ All of them need an agent credential. Portal test tokens are refused.
 | --- | --- |
 | `Delegation.Exchange(ctx, subject, actor, scopes...)` | One RFC 8693 exchange |
 | `Delegation.ExchangeForResource(...)` | The same, bound to one resource URL |
-| `DelegationChain.ConsentURL`, `HandleConsentCallback`, `SetUserToken` | Get the user's token |
+| `Delegation.ApplicationConsentURL(params)` | The sign-in URL of your application for a delegation (PKCE, optional `offline_access`) |
+| `DelegationChain.ConsentURL`, `HandleConsentCallback`, `ConsentState` | The person signs in to your application; the application redeems the code |
+| `DelegationChain.SetUserTokens`, `SetUserToken` | Register tokens that you already hold |
 | `DelegationChain.Exchange`, `ExchangeForResource`, `DelegatedToken`, `Do`, `DoRaw` | Use the delegation |
 | `DelegationChain.DelegateToSubAgent`, `DelegateToSubAgentForResource` | Extend the chain to a sub-agent |
-| `DelegationChain.Revoke`, `RevokeAll` | End delegations |
+| `DelegationChain.Revoke`, `RevokeAll`, `Forget` | End delegations: the application revokes the refresh token (`ErrDelegationNotRevoked` when only local state could be dropped) |
 | `ParseActorChain(token)`, `TokenSubject(token)` | Read claims for audit, without verification |
 
 ### `client.Mcp`
@@ -1678,7 +1875,8 @@ scopes include `poppy:verify`. They send HTTP Basic and no other credential.
 | --- | --- |
 | `New`, `NewAgent`, `NewWebAuth`, `NewAAuthClient` | Constructors |
 | `NewJITContext(source, opts...)` | A JIT context over an `Agent` or any `TokenSource` |
-| `NewDelegationChain(agent, redirectURI)` | A delegation manager |
+| `NewDelegationChainForApplication(agent, app)` | A delegation manager whose consent goes through your application |
+| `NewDelegationChain(agent, redirectURI)` | Deprecated: its consent flow cannot work with an agent's ID |
 | `VerifyAuthToken`, `NewJWKSCache`, `NewJWKSCacheForCustomDomain`, `FetchIssuerJWKS` | Verify AAuth tokens |
 | `VerifyAccessToken`, `RequireAccessToken`, `AccessTokenFromContext`, `DPoPRequestFromHTTP`, `NewAccessTokenKeyCache`, `NewAccessTokenKeyCacheForCustomDomain`, `FetchAccessTokenJWKS`, `NewMemoryReplayCache`, `RejectionReason` | Verify LumoAuth access tokens in an MCP server |
 | `NewDPoPSigner`, `NewDPoPSignerEd25519`, `NewDPoPSignerFromKey`, `LoadDPoPSigner`, `GenerateDPoPKeyPEM`, `DPoPBound`, `DPoPAccessTokenHash` | DPoP keys and helpers |
@@ -1711,7 +1909,7 @@ scopes include `poppy:verify`. They send HTTP Basic and no other credential.
 | `ErrConfig` from a `client.Poppy` call that mentions `poppy:verify` | The client has no client credentials | Pass `WithClientCredentials` with the client ID and secret of a confidential application |
 | 403 `insufficient_scope` from a `client.Poppy` call | The application's allowed scopes lack `poppy:verify` | Add the scope to the application under **Applications** |
 | Every request of a personal agent is refused with `invalid_session` and a description that names the URL (`htu`) | The URL that your API sent differs from the URL that the personal agent called | Set `PublicOrigin` to the public address, with the base path that a proxy removes |
-| A personal agent gets `500` with `{"error":"server_error"}` | The verification call failed, and the middleware has no `OnError` | Set `OnError` to log the error, then fix the cause that it names |
+| A personal agent gets `503` with `{"error":"temporarily_unavailable",…}` | The verification call failed, and the middleware has no `OnError`. `ErrNotFound`: the protocol is switched off for the organization | Set `OnError` to log the error, then fix the cause that it names |
 | `ErrRateLimited` | Too many requests | Wait for `APIError.RetryAfter`, then retry |
 | `ErrConfig` mentioning the organization | The call needs an org ID | Set `WithOrgID` or `LUMOAUTH_ORG_ID`. With a custom domain, set `WithCustomDomain` and no org ID is needed. |
 | 404 from every call to an organization's own domain | The domain is set as the base URL, so the paths carry `/orgs/...` | Pass the domain with `WithCustomDomain` or `LUMOAUTH_CUSTOM_DOMAIN`, not with `WithBaseURL` |

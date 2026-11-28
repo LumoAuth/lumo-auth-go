@@ -61,6 +61,7 @@ const (
 
 	// ── Agents (identity) ─────────────────────────────────────────────
 	RouteAgentsAsk              = "agents.ask"
+	RouteAgentsAttest           = "agents.attest"
 	RouteAgentsAuthorizeMcpTool = "agents.authorizeMcpTool"
 	RouteAgentsMe               = "agents.me"
 	RouteAgentsRegister         = "agents.register"
@@ -154,7 +155,9 @@ var Routes = map[string]Route{
 	RouteWebMagicLink:  {"POST", "/orgs/{orgId}/api/v1/oauth/magic-link"},
 
 	// ── Agents (identity) ─────────────────────────────────────────────
-	RouteAgentsAsk:              {"POST", orgBase + "/agents/ask"},
+	RouteAgentsAsk: {"POST", orgBase + "/agents/ask"},
+	// Workload attestation: public, the attestation token is the credential.
+	RouteAgentsAttest:           {"POST", orgBase + "/agents/{agentId}/attest"},
 	RouteAgentsAuthorizeMcpTool: {"POST", orgBase + "/agents/me/mcp/authorize"},
 	RouteAgentsMe:               {"GET", orgBase + "/agents/me"},
 	RouteAgentsRegister:         {"POST", orgBase + "/agents/register"},

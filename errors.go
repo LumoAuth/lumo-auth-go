@@ -14,11 +14,17 @@ import (
 //	│   ├── 403  PERMISSION_DENIED
 //	│   ├── 404  NOT_FOUND
 //	│   └── 429  RATE_LIMITED
+//	│       └── BudgetError        (body code budget_exceeded: agent budget spent)
 //	├── ValidationError            (bad input / unexpected response shape)
 //	├── ConfigError                (missing or invalid configuration)
 //	├── NetworkError               (transport failure: DNS, timeout, TLS, …)
 //	├── ApprovalError              (denied / timed out / not delivered)
-//	└── BudgetError                (agent budget exhausted)
+//	└── BudgetError                (agent budget exhausted, checked locally)
+//
+// A server answer whose body code is budget_exceeded (429, a spent agent
+// budget) is an *APIError that matches ErrRateLimited, as every 429 does,
+// and also ErrBudgetExceeded: it wraps a *BudgetError, which errors.As
+// finds. Code that caught the rate limit keeps working.
 //
 // Errors are matched with the standard library rather than by type switch:
 //
@@ -47,7 +53,9 @@ const (
 )
 
 // Sentinel errors for errors.Is. Every error returned by this SDK matches
-// ErrLumoAuth; each also matches exactly one of the specific sentinels.
+// ErrLumoAuth; each also matches exactly one of the specific sentinels,
+// except the server's budget refusal, which matches ErrRateLimited and
+// ErrBudgetExceeded (see above).
 var (
 	// ErrLumoAuth matches every error produced by this SDK.
 	ErrLumoAuth = errors.New("lumoauth error")
@@ -314,11 +322,17 @@ func newApprovalNotDelivered(reason, message, taskID string) *ApprovalError {
 	}
 }
 
-// BudgetError is returned when an agent's budget policy blocks an action.
+// BudgetError is returned when an agent's budget policy blocks an action:
+// by Agent.CheckBudget, which checks locally and makes no request, and for a
+// server answer with the body code budget_exceeded (429).
 type BudgetError struct {
 	*BaseError
-	// Budget is the policy that blocked the action.
+	// Budget is the policy that blocked the action. It is set by
+	// CheckBudget; a server refusal carries no policy, so it is nil there.
 	Budget *AgentBudget
+	// RetryAfter is the server's Retry-After hint: the time until the spent
+	// window starts again. 0 for CheckBudget.
+	RetryAfter time.Duration
 }
 
 func newBudgetExceeded(budget *AgentBudget) *BudgetError {
@@ -326,6 +340,24 @@ func newBudgetExceeded(budget *AgentBudget) *BudgetError {
 		BaseError: newError(ErrBudgetExceeded, CodeBudgetExceeded, "agent budget exceeded"),
 		Budget:    budget,
 	}
+}
+
+// Body codes that select a more specific error than the HTTP status does
+// (sdk-contract/errors.json, body_code_map).
+const bodyCodeBudgetExceeded = "budget_exceeded"
+
+// withBodyCodeError attaches the error that the response's body code names.
+// A budget_exceeded answer gets a *BudgetError as its cause, so the error
+// matches ErrBudgetExceeded as well as the sentinel of its status, and the
+// returned value stays the *APIError that v1.7.0 returned.
+func withBodyCodeError(apiErr *APIError, bodyCode string) *APIError {
+	if bodyCode == bodyCodeBudgetExceeded {
+		budgetErr := newBudgetExceeded(nil)
+		budgetErr.Message = apiErr.Message
+		budgetErr.RetryAfter = apiErr.RetryAfter
+		apiErr.cause = budgetErr
+	}
+	return apiErr
 }
 
 // AsAPIError extracts the *APIError from an error chain, reporting whether

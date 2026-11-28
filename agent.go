@@ -495,9 +495,9 @@ func (a *Agent) Budget(ctx context.Context) (*AgentBudget, error) {
 }
 
 // CheckBudget returns an error matching ErrBudgetExceeded when the agent's
-// daily token budget is spent, and nil otherwise. Budget state is cached
-// with the rest of the agent info — call Info(ctx, true) first for a live
-// reading.
+// budget is spent (any limit, see AgentBudget.Exhausted), and nil otherwise.
+// Budget state is cached with the rest of the agent info — call
+// Info(ctx, true) first for a live reading.
 func (a *Agent) CheckBudget(ctx context.Context) error {
 	budget, err := a.Budget(ctx)
 	if err != nil {

@@ -132,7 +132,7 @@ func TestRouteConstantsMatchRegistryKeys(t *testing.T) {
 		RouteOAuthAuthorize, RouteOAuthToken, RouteOAuthRevoke, RouteOAuthUserInfo,
 		RouteOAuthLogout, RouteOAuthLoginJSON,
 		RouteWebCheckEmail, RouteWebMagicLink,
-		RouteAgentsAsk, RouteAgentsAuthorizeMcpTool, RouteAgentsMe, RouteAgentsRegister, RouteAgentsReportUsage,
+		RouteAgentsAsk, RouteAgentsAttest, RouteAgentsAuthorizeMcpTool, RouteAgentsMe, RouteAgentsRegister, RouteAgentsReportUsage,
 		RouteMcpAuthorizeTool,
 		RoutePoppyVerifyRequest, RoutePoppyGetSessionStatus, RoutePoppyEndSession,
 		RouteApprovalsCreate, RouteApprovalsStatus,
